@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+## [6.1.1] - 2026-05-22
+### Fixed
+- Fixed cache key collision for deferred query mutations (see https://github.com/spiritix/lada-cache/pull/150)
+- Fixed query handler performance issue (see https://github.com/spiritix/lada-cache/issues/149)
+
 ## [6.1] - 2026-03-21
 ### Added
 - Added support for Laravel 13

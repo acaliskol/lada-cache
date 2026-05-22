@@ -77,6 +77,28 @@ class RelationshipsTest extends TestCase
         Assert::assertSame('engine-b', $loadedB->latestEngine?->name);
     }
 
+    public function test_latest_and_oldest_of_many_eager_loads_do_not_share_cache_key(): void
+    {
+        // Same outer SQL+bindings for both eager loads; only the beforeQuery-applied
+        // aggregate join differs (MAX vs MIN). Without applyBeforeQueryCallbacks before
+        // hashing, the two relations would collide on the same cache key and the second
+        // load would receive the first's rows.
+        $car = $this->makeCar(['name' => 'c-latest-oldest']);
+
+        $oldest = $car->engine()->create(['name' => 'engine-old']);
+        $newest = $car->engine()->create(['name' => 'engine-new']);
+
+        $loaded = Car::query()
+            ->whereKey($car->id)
+            ->with(['latestEngine', 'oldestEngine'])
+            ->firstOrFail();
+
+        Assert::assertSame($newest->id, $loaded->latestEngine?->id);
+        Assert::assertSame('engine-new', $loaded->latestEngine?->name);
+        Assert::assertSame($oldest->id, $loaded->oldestEngine?->id);
+        Assert::assertSame('engine-old', $loaded->oldestEngine?->name);
+    }
+
     public function test_belongs_to_many_materials_attach_detach_sync(): void
     {
         $car = $this->makeCar(['name' => 'c-btm']);
