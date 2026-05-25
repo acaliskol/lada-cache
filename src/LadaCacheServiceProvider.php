@@ -254,8 +254,15 @@ final class LadaCacheServiceProvider extends ServiceProvider
         // When Lada is disabled, lada.redis / lada.ttl_calibration_repo are not bound —
         // instantiate the command without dependencies so its disabled-mode graceful path
         // still runs (otherwise the container resolution would throw).
+        //
+        // Also gate on `calibration.enabled`: `$this->commands()` triggers Artisan
+        // resolveCommands → container resolution, which fires during
+        // `package:discover` too. In Docker build / CI contexts without a Redis
+        // connection (the common case, since calibration.enabled defaults to false),
+        // resolving `lada.redis` here would fail with "Connection refused" and crash
+        // the build. Calibration disabled = no Redis touch; handle() exits early.
         $this->app->singleton('command.lada-cache.calibrate', static function (Application $app): CalibrateCommand {
-            if (! (bool) config('lada-cache.active', true)) {
+            if (! (bool) config('lada-cache.active', true) || ! (bool) config('lada-cache.calibration.enabled', false)) {
                 return new CalibrateCommand;
             }
 

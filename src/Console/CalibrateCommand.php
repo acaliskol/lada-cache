@@ -60,16 +60,20 @@ final class CalibrateCommand extends Command
             return self::SUCCESS;
         }
 
-        if ($this->redis === null || $this->repository === null) {
-            $this->error('Lada Cache calibration dependencies are not bound. Check service provider registration.');
-
-            return self::FAILURE;
-        }
-
+        // Calibration kapalıyken erken çık — ServiceProvider deps bind etmemiş olabilir
+        // (zero-arg singleton path). Önce flag, sonra deps null kontrolü; yoksa
+        // calibration.enabled=false default değerinde manuel
+        // `php artisan lada-cache:calibrate` çağrısı FAILURE ile düşer.
         if (! (bool) config('lada-cache.calibration.enabled', false)) {
             $this->warn('Lada Cache calibration is disabled. Set LADA_CACHE_CALIBRATION_ENABLED=true to enable.');
 
             return self::SUCCESS;
+        }
+
+        if ($this->redis === null || $this->repository === null) {
+            $this->error('Lada Cache calibration dependencies are not bound. Check service provider registration.');
+
+            return self::FAILURE;
         }
 
         if (! $this->isIdleTimeSupported()) {
