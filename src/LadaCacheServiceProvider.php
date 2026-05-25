@@ -10,6 +10,8 @@ use Illuminate\Database\Events\TransactionCommitted;
 use Illuminate\Database\Events\TransactionRolledBack;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\ServiceProvider;
+use Spiritix\LadaCache\Calibration\TtlCalibrationRepository;
+use Spiritix\LadaCache\Console\CalibrateCommand;
 use Spiritix\LadaCache\Console\DisableCommand;
 use Spiritix\LadaCache\Console\EnableCommand;
 use Spiritix\LadaCache\Console\FlushCommand;
@@ -36,6 +38,12 @@ final class LadaCacheServiceProvider extends ServiceProvider
         $this->publishes([
             __DIR__.'/../config/'.self::CONFIG_FILE => config_path(self::CONFIG_FILE),
         ], 'config');
+
+        $this->loadMigrationsFrom(__DIR__.'/../database/migrations');
+
+        $this->publishesMigrations([
+            __DIR__.'/../database/migrations' => database_path('migrations'),
+        ], 'migrations');
 
         // If Lada Cache is not active, avoid wiring listeners / debugbar that could resolve Redis.
         if (! (bool) config('lada-cache.active', true)) {
@@ -95,6 +103,7 @@ final class LadaCacheServiceProvider extends ServiceProvider
             'lada.redis',
             'lada.cache',
             'lada.invalidator',
+            'lada.ttl_calibration_repo',
             'lada.ttl_resolver',
             'lada.handler',
         ];
@@ -110,7 +119,11 @@ final class LadaCacheServiceProvider extends ServiceProvider
         $this->app->singleton('lada.invalidator', static fn (Application $app) => new Invalidator($app->make('lada.redis'))
         );
 
-        $this->app->singleton('lada.ttl_resolver', static fn () => new TtlResolver);
+        $this->app->singleton('lada.ttl_calibration_repo', static fn () => new TtlCalibrationRepository);
+
+        $this->app->singleton('lada.ttl_resolver', static fn (Application $app) => new TtlResolver(
+            $app->make('lada.ttl_calibration_repo'),
+        ));
 
         $this->app->singleton('lada.handler', static fn (Application $app) => new QueryHandler(
             $app->make('lada.cache'),
@@ -213,10 +226,25 @@ final class LadaCacheServiceProvider extends ServiceProvider
         $this->app->singleton('command.lada-cache.enable', static fn () => new EnableCommand);
         $this->app->singleton('command.lada-cache.disable', static fn () => new DisableCommand);
 
+        // When Lada is disabled, lada.redis / lada.ttl_calibration_repo are not bound —
+        // instantiate the command without dependencies so its disabled-mode graceful path
+        // still runs (otherwise the container resolution would throw).
+        $this->app->singleton('command.lada-cache.calibrate', static function (Application $app): CalibrateCommand {
+            if (! (bool) config('lada-cache.active', true)) {
+                return new CalibrateCommand;
+            }
+
+            return new CalibrateCommand(
+                $app->make('lada.redis'),
+                $app->make('lada.ttl_calibration_repo'),
+            );
+        });
+
         $this->commands([
             'command.lada-cache.flush',
             'command.lada-cache.enable',
             'command.lada-cache.disable',
+            'command.lada-cache.calibrate',
         ]);
     }
 

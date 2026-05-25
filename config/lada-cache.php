@@ -74,8 +74,10 @@ return [
     | global expiration_time. Resolution order (first non-null wins):
     |   1. $model->getLadaTtl() if model implements
     |      Spiritix\LadaCache\Contracts\HasLadaTtl
-    |   2. config('lada-cache.model_ttls.<FQCN>')
-    |   3. config('lada-cache.expiration_time') (global)
+    |   2. lada_cache_calibrations.calibrated_ttl
+    |      (auto-calibration via lada-cache:calibrate, see "Calibration" below)
+    |   3. config('lada-cache.model_ttls.<FQCN>')
+    |   4. config('lada-cache.expiration_time') (global)
     |
     | Examples:
     |   App\Models\City::class       => 86400 * 30, // 30 days for rarely-changing data
@@ -87,6 +89,41 @@ return [
     */
     'model_ttls' => [
         // App\Models\City::class => 86400 * 30,
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Auto-calibration
+    |--------------------------------------------------------------------------
+    |
+    | The `lada-cache:calibrate` Artisan command samples Redis OBJECT IDLETIME
+    | for cached keys belonging to each Lada-cached model, computes the
+    | P95 idle time, and derives a per-model TTL via
+    |
+    |     calibrated_ttl = max(ceil(P95 * safety_factor), floor(previous_ttl / 2))
+    |
+    | The floor term guards against survivor bias — OBJECT IDLETIME can only
+    | sample keys that haven't yet been evicted, so successive runs would
+    | otherwise shrink TTLs monotonically toward zero.
+    |
+    | Results are stored in the `lada_cache_calibrations` table and consumed
+    | by TtlResolver between the HasLadaTtl interface and the static
+    | `model_ttls` map (see "Per-model TTL overrides" above).
+    |
+    | Safety:
+    |   - The command refuses to run when Redis maxmemory-policy is *-lfu
+    |     (IDLETIME is unsupported under LFU eviction).
+    |   - `--apply` is required to persist; the default is a dry-run table.
+    |   - Models with fewer than `min_samples` data points are skipped.
+    |
+    | Designed for periodic cron use, e.g. weekly: `lada-cache:calibrate --apply`.
+    |
+    */
+    'calibration' => [
+        'enabled' => (bool) env('LADA_CACHE_CALIBRATION_ENABLED', false),
+        'safety_factor' => (float) env('LADA_CACHE_CALIBRATION_SAFETY_FACTOR', 2.0),
+        'min_samples' => (int) env('LADA_CACHE_CALIBRATION_MIN_SAMPLES', 50),
+        'cache_ttl' => (int) env('LADA_CACHE_CALIBRATION_CACHE_TTL', 300),
     ],
 
     /*

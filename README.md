@@ -153,7 +153,65 @@ php artisan lada-cache:disable
 
 # Re-enable cache
 php artisan lada-cache:enable
+
+# Auto-calibrate per-model TTLs from Redis OBJECT IDLETIME (see Auto-calibration below)
+php artisan lada-cache:calibrate              # dry-run
+php artisan lada-cache:calibrate --apply      # persist results
 ```
+
+## Auto-calibration
+
+Picking the right TTL per model is a guessing game without production data.
+`lada-cache:calibrate` removes the guesswork: it samples Redis `OBJECT IDLETIME`
+for cached keys belonging to each Lada-cached model, computes the P95 idle
+time, and derives a per-model TTL via:
+
+```
+calibrated_ttl = max(ceil(P95 * safety_factor), floor(previous_ttl / 2))
+```
+
+The floor term protects against survivor bias — `OBJECT IDLETIME` can only
+sample keys that haven't yet been evicted, so successive runs would otherwise
+shrink TTLs monotonically toward zero.
+
+Results are stored in the `lada_cache_calibrations` table (shipped via package
+migration) and consumed by `TtlResolver` between the `HasLadaTtl` interface
+and the static `model_ttls` config map.
+
+### Enable
+
+```env
+LADA_CACHE_CALIBRATION_ENABLED=true        # default: false
+LADA_CACHE_CALIBRATION_SAFETY_FACTOR=2.0   # P95 multiplier
+LADA_CACHE_CALIBRATION_MIN_SAMPLES=50      # skip models with fewer samples
+LADA_CACHE_CALIBRATION_CACHE_TTL=300       # in-memory map cache, seconds
+```
+
+Then publish & run the package migration:
+
+```bash
+php artisan vendor:publish --tag=migrations
+php artisan migrate
+```
+
+### Recommended cron
+
+Run weekly so each model's TTL converges on actual access patterns:
+
+```php
+// routes/console.php (Laravel 11+) or app/Console/Kernel.php
+Schedule::command('lada-cache:calibrate --apply')->weekly();
+```
+
+### Safety
+
+- Refuses to run when Redis `maxmemory-policy` is `*-lfu` (IDLETIME is
+  unsupported under LFU eviction — using it would calibrate every TTL
+  toward zero).
+- Dry-run by default; `--apply` is required to mutate `lada_cache_calibrations`.
+- Skips models with fewer than `min_samples` data points (including 0).
+- Pipelined `OBJECT IDLETIME` calls and cursor-driven `SSCAN`/`SCAN` keep
+  the command non-blocking even against millions of cached keys.
 
 ## Known Issues and Limitations
 
