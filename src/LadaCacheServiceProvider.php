@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Spiritix\LadaCache;
 
 use Illuminate\Contracts\Foundation\Application;
+use Illuminate\Database\Eloquent\Builder as EloquentBuilder;
 use Illuminate\Database\Events\MigrationsEnded;
 use Illuminate\Database\Events\TransactionCommitted;
 use Illuminate\Database\Events\TransactionRolledBack;
@@ -16,6 +17,7 @@ use Spiritix\LadaCache\Console\FlushCommand;
 use Spiritix\LadaCache\Database\MySqlConnection as LadaMySqlConnection;
 use Spiritix\LadaCache\Database\MariaDbConnection as LadaMariaDbConnection;
 use Spiritix\LadaCache\Database\PostgresConnection as LadaPostgresConnection;
+use Spiritix\LadaCache\Database\QueryBuilder;
 use Spiritix\LadaCache\Database\SqliteConnection as LadaSqliteConnection;
 use Spiritix\LadaCache\Database\SqlServerConnection as LadaSqlServerConnection;
 use Spiritix\LadaCache\Debug\CacheCollector;
@@ -36,6 +38,21 @@ final class LadaCacheServiceProvider extends ServiceProvider
         $this->publishes([
             __DIR__.'/../config/'.self::CONFIG_FILE => config_path(self::CONFIG_FILE),
         ], 'config');
+
+        // Eloquent macro: propagate withoutCache() from Eloquent builder to the underlying Lada QueryBuilder.
+        // Registered BEFORE the active-cache guard so the macro stays available even when Lada is disabled —
+        // in that case the underlying query is a vanilla Laravel Builder (not our QueryBuilder), the instanceof
+        // check fails, and the call becomes a graceful no-op instead of throwing BadMethodCallException.
+        EloquentBuilder::macro('withoutCache', function () {
+            /** @var EloquentBuilder $this */
+            $query = $this->getQuery();
+
+            if ($query instanceof QueryBuilder) {
+                $query->withoutCache();
+            }
+
+            return $this;
+        });
 
         // If Lada Cache is not active, avoid wiring listeners / debugbar that could resolve Redis.
         if (! (bool) config('lada-cache.active', true)) {
