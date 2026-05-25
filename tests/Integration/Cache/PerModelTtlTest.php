@@ -7,6 +7,7 @@ namespace Spiritix\LadaCache\Tests\Integration\Cache;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Support\Facades\Config;
 use Spiritix\LadaCache\Contracts\HasLadaTtl;
+use Spiritix\LadaCache\Database\LadaCacheTrait;
 use Spiritix\LadaCache\Redis as LadaRedis;
 use Spiritix\LadaCache\Tests\TestCase;
 use Spiritix\LadaCache\TtlResolver;
@@ -63,6 +64,51 @@ class PerModelTtlTest extends TestCase
         $resolver = new TtlResolver();
 
         $this->assertSame(0, $resolver->resolve(new HasTtlZeroFixture()));
+    }
+
+    // ------------------------------------------------------------------
+    // LadaCacheTrait: default getLadaTtl() reads from $ladaTtl property
+    // ------------------------------------------------------------------
+
+    public function testResolveUsesTraitPropertyWhenOnlyPropertySet(): void
+    {
+        $resolver = new TtlResolver();
+
+        // The model only declares `public ?int $ladaTtl = 120;`. The trait's
+        // default getLadaTtl() must read the property and return its value.
+        $this->assertSame(120, $resolver->resolve(new PropertyOnlyTtlFixture()));
+    }
+
+    public function testResolveNullTraitPropertyFallsBackToConfig(): void
+    {
+        Config::set('lada-cache.model_ttls', [PropertyNullTtlFixture::class => 3600]);
+        $resolver = new TtlResolver();
+
+        // Default `$ladaTtl = null` → trait method returns null → config fallback applies.
+        $this->assertSame(3600, $resolver->resolve(new PropertyNullTtlFixture()));
+    }
+
+    public function testResolveFallsBackToConfigWhenInterfaceImplementedButPropertyMissing(): void
+    {
+        Config::set('lada-cache.model_ttls', [PropertyMissingTtlFixture::class => 1234]);
+        $resolver = new TtlResolver();
+
+        // implements HasLadaTtl but `$ladaTtl` is not declared at all —
+        // property_exists() returns false, trait getLadaTtl() returns null,
+        // resolver falls through to config.
+        $this->assertSame(1234, $resolver->resolve(new PropertyMissingTtlFixture()));
+    }
+
+    public function testResolveFallsBackWhenTypedPropertyIsUninitialized(): void
+    {
+        Config::set('lada-cache.model_ttls', [PropertyUninitializedTtlFixture::class => 4321]);
+        $resolver = new TtlResolver();
+
+        // `public ?int $ladaTtl;` (typed, no default) — property_exists() is true
+        // but reading it would throw Error("must not be accessed before initialization").
+        // The trait guards with ReflectionProperty::isInitialized() and returns null,
+        // letting config fallback take over.
+        $this->assertSame(4321, $resolver->resolve(new PropertyUninitializedTtlFixture()));
     }
 
     // ------------------------------------------------------------------
@@ -141,4 +187,35 @@ class HasTtlZeroFixture extends Model implements HasLadaTtl
     {
         return 0;
     }
+}
+
+class PropertyOnlyTtlFixture extends Model implements HasLadaTtl
+{
+    use LadaCacheTrait;
+
+    public ?int $ladaTtl = 120;
+}
+
+class PropertyNullTtlFixture extends Model implements HasLadaTtl
+{
+    use LadaCacheTrait;
+
+    // Explicit null → property_exists() true, value null → resolver falls back to config.
+    public ?int $ladaTtl = null;
+}
+
+class PropertyMissingTtlFixture extends Model implements HasLadaTtl
+{
+    use LadaCacheTrait;
+    // No $ladaTtl declared at all — covers the property_exists() === false branch.
+}
+
+class PropertyUninitializedTtlFixture extends Model implements HasLadaTtl
+{
+    use LadaCacheTrait;
+
+    // Typed property without a default: property_exists() true, but reading
+    // it before assignment throws an uninitialized Error. The trait's
+    // ReflectionProperty::isInitialized() guard prevents the crash.
+    public ?int $ladaTtl;
 }

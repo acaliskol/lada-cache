@@ -13,6 +13,18 @@ namespace Spiritix\LadaCache\Contracts;
  *   2. config('lada-cache.model_ttls.<ClassName>')
  *   3. global config('lada-cache.expiration_time')
  *
+ * Easiest way to opt in is via `LadaCacheTrait`, which already provides a
+ * default `getLadaTtl()` implementation reading from a `public ?int $ladaTtl`
+ * property declared on the model:
+ *
+ *     class City extends Model implements HasLadaTtl
+ *     {
+ *         use LadaCacheTrait;
+ *         public ?int $ladaTtl = 86400 * 30; // 30 days
+ *     }
+ *
+ * Override the method only when dynamic TTL logic is required.
+ *
  * Semantics of the returned value:
  *   - null : defer to config-level fallback (model_ttls or global)
  *   - > 0  : TTL in seconds (e.g., 3600 = 1 hour)
