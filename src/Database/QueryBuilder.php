@@ -25,7 +25,7 @@ class QueryBuilder extends Builder
 
     private readonly ?Model $model;
 
-    private bool $skipCache = false;
+    private bool $cacheBypassed = false;
 
     public function __construct(
         ConnectionInterface $connection,
@@ -40,19 +40,18 @@ class QueryBuilder extends Builder
     }
 
     /**
-     * Bypass Lada Cache for this single query — both read (no get/set) and write (no invalidation queue).
-     * Useful for diagnostics, freshness-critical reads, and ad-hoc cache busting without touching config.
+     * Bypass Lada Cache for this query (skips read caching and write invalidation).
      */
     public function withoutCache(): static
     {
-        $this->skipCache = true;
+        $this->cacheBypassed = true;
 
         return $this;
     }
 
-    public function isSkippingCache(): bool
+    public function isCacheBypassed(): bool
     {
-        return $this->skipCache;
+        return $this->cacheBypassed;
     }
 
     /** {@inheritDoc} */
@@ -107,7 +106,7 @@ class QueryBuilder extends Builder
         // Do not cache queries that use pessimistic locks (lockForUpdate/sharedLock).
         // Laravel stores lock intent in $this->lock; when present we should always hit the DB.
         // Also bypass when the caller opted out via withoutCache().
-        if ($this->lock !== null || $this->skipCache) {
+        if ($this->lock !== null || $this->cacheBypassed) {
             return parent::runSelect();
         }
 
@@ -151,7 +150,7 @@ class QueryBuilder extends Builder
     public function insert(array $values)
     {
         $result = parent::insert($values);
-        $this->invalidateUnlessSkipped(Reflector::QUERY_TYPE_INSERT, $values);
+        $this->invalidateUnlessBypassed(Reflector::QUERY_TYPE_INSERT, $values);
 
         return $result;
     }
@@ -161,7 +160,7 @@ class QueryBuilder extends Builder
     {
         $result = parent::insertUsing($columns, $query);
         // Treat as INSERT for invalidation.
-        $this->invalidateUnlessSkipped(Reflector::QUERY_TYPE_INSERT);
+        $this->invalidateUnlessBypassed(Reflector::QUERY_TYPE_INSERT);
 
         return $result;
     }
@@ -171,7 +170,7 @@ class QueryBuilder extends Builder
     {
         $result = parent::insertOrIgnoreUsing($columns, $query);
         // May still insert rows; invalidate conservatively as INSERT.
-        $this->invalidateUnlessSkipped(Reflector::QUERY_TYPE_INSERT);
+        $this->invalidateUnlessBypassed(Reflector::QUERY_TYPE_INSERT);
 
         return $result;
     }
@@ -181,7 +180,7 @@ class QueryBuilder extends Builder
     {
         $result = parent::updateFrom($values);
         // Update-from modifies rows; invalidate as UPDATE.
-        $this->invalidateUnlessSkipped(Reflector::QUERY_TYPE_UPDATE, $values);
+        $this->invalidateUnlessBypassed(Reflector::QUERY_TYPE_UPDATE, $values);
 
         return $result;
     }
@@ -190,7 +189,7 @@ class QueryBuilder extends Builder
     public function insertGetId(array $values, $sequence = null)
     {
         $id = parent::insertGetId($values, $sequence);
-        $this->invalidateUnlessSkipped(Reflector::QUERY_TYPE_INSERT, $values);
+        $this->invalidateUnlessBypassed(Reflector::QUERY_TYPE_INSERT, $values);
 
         return $id;
     }
@@ -199,7 +198,7 @@ class QueryBuilder extends Builder
     public function update(array $values)
     {
         $count = parent::update($values);
-        $this->invalidateUnlessSkipped(Reflector::QUERY_TYPE_UPDATE, $values);
+        $this->invalidateUnlessBypassed(Reflector::QUERY_TYPE_UPDATE, $values);
 
         return $count;
     }
@@ -209,7 +208,7 @@ class QueryBuilder extends Builder
     {
         $result = parent::upsert($values, $uniqueBy, $update);
         // Treat UPSERT as an UPDATE-like invalidation to safely clear unspecific table tags.
-        $this->invalidateUnlessSkipped(Reflector::QUERY_TYPE_UPDATE, is_array($values) ? (array) $values : []);
+        $this->invalidateUnlessBypassed(Reflector::QUERY_TYPE_UPDATE, is_array($values) ? (array) $values : []);
 
         return $result;
     }
@@ -219,7 +218,7 @@ class QueryBuilder extends Builder
     {
         $result = parent::insertOrIgnore($values);
         // Insert-or-ignore may still insert rows; invalidate as INSERT.
-        $this->invalidateUnlessSkipped(Reflector::QUERY_TYPE_INSERT, $values);
+        $this->invalidateUnlessBypassed(Reflector::QUERY_TYPE_INSERT, $values);
 
         return $result;
     }
@@ -229,7 +228,7 @@ class QueryBuilder extends Builder
     {
         $result = parent::updateOrInsert($attributes, $values);
         // May perform insert or update; invalidate conservatively as UPDATE.
-        $this->invalidateUnlessSkipped(Reflector::QUERY_TYPE_UPDATE, $values ?: $attributes);
+        $this->invalidateUnlessBypassed(Reflector::QUERY_TYPE_UPDATE, $values ?: $attributes);
 
         return $result;
     }
@@ -238,7 +237,7 @@ class QueryBuilder extends Builder
     public function delete($id = null)
     {
         $count = parent::delete($id);
-        $this->invalidateUnlessSkipped(Reflector::QUERY_TYPE_DELETE, [$this->getPrimaryKeyName() => $id]);
+        $this->invalidateUnlessBypassed(Reflector::QUERY_TYPE_DELETE, [$this->getPrimaryKeyName() => $id]);
 
         return $count;
     }
@@ -247,23 +246,12 @@ class QueryBuilder extends Builder
     public function truncate()
     {
         parent::truncate();
-        $this->invalidateUnlessSkipped(Reflector::QUERY_TYPE_TRUNCATE);
+        $this->invalidateUnlessBypassed(Reflector::QUERY_TYPE_TRUNCATE);
     }
 
-    /**
-     * Invalidate cache for the current query unless withoutCache() was called.
-     *
-     * Called from every mutation override (insert/update/delete/upsert/truncate variants)
-     * after the parent operation completes. The skipCache guard lets withoutCache()
-     * suppress both read caching and invalidation queueing from one place.
-     *
-     * Exception safety: callers invoke this AFTER parent::method(), so a thrown
-     * mutation aborts before reaching invalidation — a failed mutation does not
-     * invalidate the cache.
-     */
-    private function invalidateUnlessSkipped(string $queryType, array $values = []): void
+    private function invalidateUnlessBypassed(string $queryType, array $values = []): void
     {
-        if ($this->skipCache) {
+        if ($this->cacheBypassed) {
             return;
         }
 

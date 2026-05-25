@@ -142,6 +142,20 @@ LADA_CACHE_ACTIVE=true
 LADA_CACHE_DEBUGBAR=true
 ```
 
+### Bypassing the cache per query
+
+Use `withoutCache()` to opt a single query out of caching. The query skips both read caching and write invalidation, then continues through Laravel as usual:
+
+```php
+// Eloquent
+$user = User::where('id', $id)->withoutCache()->first();
+
+// Query Builder
+DB::table('users')->where('id', $id)->withoutCache()->update(['name' => 'New']);
+```
+
+This is useful for freshness-critical reads, diagnostics, or ad-hoc cache busting without touching the configuration.
+
 ## Console Commands
 
 ```bash

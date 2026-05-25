@@ -39,10 +39,8 @@ final class LadaCacheServiceProvider extends ServiceProvider
             __DIR__.'/../config/'.self::CONFIG_FILE => config_path(self::CONFIG_FILE),
         ], 'config');
 
-        // Eloquent macro: propagate withoutCache() from Eloquent builder to the underlying Lada QueryBuilder.
-        // Registered BEFORE the active-cache guard so the macro stays available even when Lada is disabled —
-        // in that case the underlying query is a vanilla Laravel Builder (not our QueryBuilder), the instanceof
-        // check fails, and the call becomes a graceful no-op instead of throwing BadMethodCallException.
+        // Propagate withoutCache() from the Eloquent builder to the underlying Lada query builder.
+        // Registered outside the active guard so the call is a no-op when Lada is disabled.
         EloquentBuilder::macro('withoutCache', function () {
             /** @var EloquentBuilder $this */
             $query = $this->getQuery();
