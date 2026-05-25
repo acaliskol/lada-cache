@@ -124,6 +124,14 @@ return [
         'safety_factor' => (float) env('LADA_CACHE_CALIBRATION_SAFETY_FACTOR', 2.0),
         'min_samples' => (int) env('LADA_CACHE_CALIBRATION_MIN_SAMPLES', 50),
         'cache_ttl' => (int) env('LADA_CACHE_CALIBRATION_CACHE_TTL', 300),
+
+        // Cron expression for the auto-scheduled calibration run. Empty string disables
+        // the auto-schedule (you can still invoke `php artisan lada-cache:calibrate --apply`
+        // manually or register it yourself in `routes/console.php`).
+        //
+        // Default `0 3 * * 0` = every Sunday at 03:00. Both `enabled=true` AND a non-empty
+        // schedule string are required for the service provider to register the cron.
+        'schedule' => (string) env('LADA_CACHE_CALIBRATION_SCHEDULE', '0 3 * * 0'),
     ],
 
     /*

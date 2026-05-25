@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Spiritix\LadaCache;
 
+use Illuminate\Console\Scheduling\Schedule;
 use Illuminate\Contracts\Foundation\Application;
 use Illuminate\Database\Events\MigrationsEnded;
 use Illuminate\Database\Events\TransactionCommitted;
@@ -72,6 +73,30 @@ final class LadaCacheServiceProvider extends ServiceProvider
             /** @var Cache $cache */
             $cache = $this->app->make('lada.cache');
             $cache->flush();
+        });
+
+        // Auto-register the calibration cron when enabled and a schedule expression is set.
+        // Uses callAfterResolving so we don't force the Schedule kernel to boot unnecessarily —
+        // it fires only when the framework itself resolves the scheduler (artisan schedule:* etc).
+        // To opt out, set config('lada-cache.calibration.schedule') to an empty string and call
+        // Schedule::command(...) yourself in routes/console.php instead.
+        $this->callAfterResolving(Schedule::class, function (Schedule $schedule): void {
+            if (! (bool) config('lada-cache.calibration.enabled', false)) {
+                return;
+            }
+
+            $cron = trim((string) config('lada-cache.calibration.schedule', ''));
+
+            if ($cron === '') {
+                return;
+            }
+
+            $schedule->command('lada-cache:calibrate', ['--apply'])
+                ->cron($cron)
+                ->onOneServer()
+                ->withoutOverlapping()
+                ->runInBackground()
+            ;
         });
     }
 

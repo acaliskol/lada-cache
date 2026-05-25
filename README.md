@@ -185,6 +185,7 @@ LADA_CACHE_CALIBRATION_ENABLED=true        # default: false
 LADA_CACHE_CALIBRATION_SAFETY_FACTOR=2.0   # P95 multiplier
 LADA_CACHE_CALIBRATION_MIN_SAMPLES=50      # skip models with fewer samples
 LADA_CACHE_CALIBRATION_CACHE_TTL=300       # in-memory map cache, seconds
+LADA_CACHE_CALIBRATION_SCHEDULE="0 3 * * 0"  # cron — empty string = no auto-schedule
 ```
 
 Then publish & run the package migration:
@@ -194,14 +195,24 @@ php artisan vendor:publish --tag=migrations
 php artisan migrate
 ```
 
-### Recommended cron
+### Auto-scheduled cron
 
-Run weekly so each model's TTL converges on actual access patterns:
+The package auto-registers the calibration cron via
+`callAfterResolving(Schedule::class)` when both `enabled=true` and `schedule`
+(a cron expression) are set. The default schedule is **every Sunday at 03:00**
+(`0 3 * * 0`) — long enough for TTLs to converge on real access patterns
+without bombing Redis with daily scans.
+
+To customise, override `LADA_CACHE_CALIBRATION_SCHEDULE` with any cron
+expression, or set it to an empty string and register the command yourself:
 
 ```php
 // routes/console.php (Laravel 11+) or app/Console/Kernel.php
 Schedule::command('lada-cache:calibrate --apply')->weekly();
 ```
+
+The auto-registered job runs with `->onOneServer()`, `->withoutOverlapping()`,
+and `->runInBackground()` — safe under multi-server Horizon deployments.
 
 ### Safety
 
