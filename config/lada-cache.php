@@ -132,6 +132,97 @@ return [
         // Default `0 3 * * 0` = every Sunday at 03:00. Both `enabled=true` AND a non-empty
         // schedule string are required for the service provider to register the cron.
         'schedule' => (string) env('LADA_CACHE_CALIBRATION_SCHEDULE', '0 3 * * 0'),
+
+        // -------------------------------------------------------------------
+        // Activity-aware calibration (opt-in — requires `events.enabled` AND
+        // `stats.enabled` so StatsCounter has data to read).
+        // -------------------------------------------------------------------
+        //
+        // The calibrate command can enrich the IDLETIME signal with per-table
+        // read / write counts recorded by StatsCounter. With activity data:
+        //   - `write_heavy` tables skip the survivor-bias floor so an invalidation
+        //     -dominated workload doesn't inflate TTL into wasted memory.
+        //   - `read_heavy` tables run through a convergent hit_ratio controller
+        //     that pulls TTL toward `target_hit_ratio` by bounded steps.
+        // Without activity (Redis down, stats disabled, cold window) the command
+        // falls back to the original IDLETIME-only behavior.
+
+        // How far back to aggregate StatsCounter buckets, in hours.
+        // Default 168 = 7 days, matching the bucket retention default below.
+        'stats_lookback_hours' => (int) env('LADA_CACHE_CALIBRATION_STATS_LOOKBACK_HOURS', 168),
+
+        // Minimum reads+writes in the lookback window before the signal is
+        // trusted. Below this, the activity adjustment is skipped and the run
+        // is labeled 'no_activity'. Guards against fitting TTL to thin data.
+        'min_reads_for_signal' => (int) env('LADA_CACHE_CALIBRATION_MIN_READS_FOR_SIGNAL', 10),
+
+        // invalidates / (hits+misses) ≥ this ratio classifies the table as
+        // write_heavy. Default 0.5 = invalidations equal reads.
+        'write_heavy_ratio' => (float) env('LADA_CACHE_CALIBRATION_WRITE_HEAVY_RATIO', 0.5),
+
+        // Read-heavy proportional control parameters (HitRatioAdjustment).
+        // Defaults: pull toward 80% hit ratio, ±20% per-run step,
+        // 30% learning rate, 5% deadband for hysteresis.
+        'target_hit_ratio' => (float) env('LADA_CACHE_CALIBRATION_TARGET_HIT_RATIO', 0.80),
+        'hit_ratio_deadband' => (float) env('LADA_CACHE_CALIBRATION_HIT_RATIO_DEADBAND', 0.05),
+        'hit_ratio_learning_rate' => (float) env('LADA_CACHE_CALIBRATION_HIT_RATIO_LEARNING_RATE', 0.30),
+        'hit_ratio_max_step' => (float) env('LADA_CACHE_CALIBRATION_HIT_RATIO_MAX_STEP', 0.20),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Events
+    |--------------------------------------------------------------------------
+    |
+    | Lada Cache dispatches a {@see Spiritix\LadaCache\Events\LadaCacheActivity}
+    | event on every cache hit / miss / invalidate when enabled. This is an
+    | opt-in monitoring hook — disabled by default so unused installs incur
+    | zero overhead on the query hot path.
+    |
+    | Activation requires `events.enabled = true`. Listeners can read the
+    | (action, key, tags, table) payload to build their own counters, or use
+    | the bundled {@see Spiritix\LadaCache\Stats\StatsCounter} listener
+    | configured below.
+    |
+    */
+    'events' => [
+        'enabled' => (bool) env('LADA_CACHE_EVENTS_ENABLED', false),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Stats Counter
+    |--------------------------------------------------------------------------
+    |
+    | When `stats.enabled = true` (and `events.enabled = true`), the bundled
+    | StatsCounter listener aggregates LadaCacheActivity events in process
+    | memory and periodically writes per-table HASH counters to Redis:
+    |
+    |   lada:stats:YYYYMMDDHH
+    |     field "users:hit"        → 42819
+    |     field "users:miss"       → 512
+    |     field "users:invalidate" → 120
+    |     ...
+    |
+    | Flush triggers (whichever fires first):
+    |   - Distinct (table:action) keys exceed `flush_max_batch`
+    |   - Time since last flush exceeds `flush_max_seconds`
+    |   - The application terminates
+    |
+    | The `lada-cache:calibrate` command reads these buckets via StatsReader
+    | to drive activity-aware TTL adjustment (see "Activity-aware calibration"
+    | above).
+    |
+    */
+    'stats' => [
+        'enabled' => (bool) env('LADA_CACHE_STATS_ENABLED', false),
+
+        // In-memory aggregation limits before forcing a flush.
+        'flush_max_batch' => (int) env('LADA_CACHE_STATS_FLUSH_MAX_BATCH', 100),
+        'flush_max_seconds' => (float) env('LADA_CACHE_STATS_FLUSH_MAX_SECONDS', 5.0),
+
+        // Per-bucket retention in seconds. Default = 7 days.
+        'bucket_ttl_seconds' => (int) env('LADA_CACHE_STATS_BUCKET_TTL_SECONDS', 86400 * 7),
     ],
 
     /*

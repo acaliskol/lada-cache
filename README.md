@@ -224,6 +224,72 @@ and `->runInBackground()` — safe under multi-server Horizon deployments.
 - Pipelined `OBJECT IDLETIME` calls and cursor-driven `SSCAN`/`SCAN` keep
   the command non-blocking even against millions of cached keys.
 
+## Stats / Activity Counter
+
+Lada Cache can publish a `LadaCacheActivity` event on every cache hit, miss,
+and invalidate. The event is **opt-in** — disabled by default so unused
+installs incur zero overhead on the query hot path.
+
+```env
+LADA_CACHE_EVENTS_ENABLED=true
+```
+
+The event carries the action (`hit`/`miss`/`invalidate`), the cache key, the
+tags, and the primary table — letting you wire any listener you like (Prometheus
+exporter, structured log line, custom counter…).
+
+### Bundled StatsCounter listener
+
+For the common "count per-table activity over time" case, the package ships a
+buffered listener that writes hourly HASH buckets to Redis:
+
+```env
+LADA_CACHE_EVENTS_ENABLED=true
+LADA_CACHE_STATS_ENABLED=true
+```
+
+```
+lada:stats:YYYYMMDDHH
+  field "users:hit"        → 42819
+  field "users:miss"       → 512
+  field "users:invalidate" → 120
+  ...
+```
+
+Buckets self-evict via TTL (default 7 days). The counter aggregates in process
+memory and flushes when distinct (table:action) keys exceed
+`flush_max_batch`, when `flush_max_seconds` elapses since the last flush, or
+when the application terminates — works under FPM, Octane, queue workers, and
+the scheduler.
+
+### Activity-aware calibration
+
+When the StatsCounter is enabled, `lada-cache:calibrate` enriches its IDLETIME
+signal with read / write counts from the last `stats_lookback_hours` and labels
+each model with a signal source:
+
+| Signal | When | Effect |
+|--------|------|--------|
+| `idletime_only` | StatsReader unavailable or Redis lookup failed | Original IDLETIME-only TTL |
+| `no_activity` | reads + writes below `min_reads_for_signal` | Original IDLETIME-only TTL |
+| `write_heavy` | invalidates / (hits+misses) ≥ `write_heavy_ratio` | Skip survivor-bias floor (writes were going to invalidate anyway) |
+| `read_heavy` | otherwise | Hit-ratio proportional control toward `target_hit_ratio` |
+
+Tuning knobs (all `LADA_CACHE_CALIBRATION_*` env vars):
+
+```env
+LADA_CACHE_CALIBRATION_STATS_LOOKBACK_HOURS=168      # 7 days
+LADA_CACHE_CALIBRATION_MIN_READS_FOR_SIGNAL=10
+LADA_CACHE_CALIBRATION_WRITE_HEAVY_RATIO=0.5
+LADA_CACHE_CALIBRATION_TARGET_HIT_RATIO=0.80
+LADA_CACHE_CALIBRATION_HIT_RATIO_DEADBAND=0.05
+LADA_CACHE_CALIBRATION_HIT_RATIO_LEARNING_RATE=0.30
+LADA_CACHE_CALIBRATION_HIT_RATIO_MAX_STEP=0.20
+```
+
+The calibration log line includes per-signal counters so you can graph the
+distribution of read-heavy vs write-heavy models across runs.
+
 ## Known Issues and Limitations
 
 - Multiple connections (`DB::connection('foo')`) are only supported when using Lada’s connection integration. Models defining `$connection` work automatically.  

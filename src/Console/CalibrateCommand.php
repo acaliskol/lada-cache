@@ -10,13 +10,16 @@ use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Log;
 use InvalidArgumentException;
 use ReflectionClass;
+use Spiritix\LadaCache\Calibration\HitRatioAdjustment;
 use Spiritix\LadaCache\Calibration\TtlCalibrationRepository;
 use Spiritix\LadaCache\Database\LadaCacheTrait;
 use Spiritix\LadaCache\Redis;
+use Spiritix\LadaCache\Stats\StatsReader;
 use Throwable;
 
 /**
- * Sample Redis OBJECT IDLETIME for Lada-cached models and derive per-model TTLs.
+ * Sample Redis OBJECT IDLETIME (and optionally StatsCounter activity) for
+ * Lada-cached models and derive per-model TTLs.
  *
  * Algorithm:
  *   1. Discover Eloquent models using LadaCacheTrait (or use --model=FQCN).
@@ -24,8 +27,17 @@ use Throwable;
  *      and `:table_unspecific:<table>` to enumerate cache keys for that table.
  *   3. Run OBJECT IDLETIME per key → seconds since last access (pipelined).
  *   4. Compute P50, P95, max of the distribution.
- *   5. calibrated_ttl = max(ceil(P95 × safety_factor), floor(previous_ttl / 2)).
- *   6. Skip models with samples < min_samples; persist only with --apply.
+ *   5. raw_calibrated = ceil(P95 × safety_factor).
+ *   6. Floor against survivor-bias: max(raw, previousTtl / 2).
+ *   7. (Opt-in) Read StatsCounter activity for the table over the last
+ *      `stats_lookback_hours` hours and adjust the TTL by signal:
+ *        - 'idletime_only' — StatsReader unavailable or lookback=0; original behavior.
+ *        - 'no_activity'   — reads+writes below `min_reads_for_signal`; original behavior.
+ *        - 'write_heavy'   — invalidates/(hits+misses) ≥ `write_heavy_ratio`;
+ *                            skip floor (raw_calibrated as-is), since invalidations
+ *                            dominate any TTL extension we'd grant.
+ *        - 'read_heavy'    — default activity path; hit-ratio proportional control.
+ *   8. Skip models with samples < min_samples; persist only with --apply.
  *
  * Safety:
  *   - Aborts when Redis maxmemory-policy is *-lfu (IDLETIME is unsupported there).
@@ -43,11 +55,12 @@ final class CalibrateCommand extends Command
                             {--models-path= : Override scanned directory (default: app_path("Models"))}
                             {--models-namespace= : Override scanned namespace (default: "App\\\\Models\\\\")}';
 
-    protected $description = 'Sample Redis OBJECT IDLETIME for Lada-cached models and compute per-model TTLs.';
+    protected $description = 'Sample Redis OBJECT IDLETIME (and optional activity counters) for Lada-cached models and compute per-model TTLs.';
 
     public function __construct(
         private readonly ?Redis $redis = null,
         private readonly ?TtlCalibrationRepository $repository = null,
+        private readonly ?StatsReader $statsReader = null,
     ) {
         parent::__construct();
     }
@@ -101,12 +114,26 @@ final class CalibrateCommand extends Command
         $minSamples = (int) config('lada-cache.calibration.min_samples', 50);
         $apply = (bool) $this->option('apply');
 
+        $lookbackHours = (int) config('lada-cache.calibration.stats_lookback_hours', 168);
+        $this->warnIfLookbackExceedsBucketTtl($lookbackHours);
+        // null  = stats signal unavailable (reader not configured OR Redis lookup failed);
+        // []    = configured + reached Redis, but no activity recorded in window;
+        // array = per-table activity counters.
+        // adjustForActivity uses the null/[] distinction to label the run
+        // 'idletime_only' vs 'no_activity' so monitoring can tell a real Redis
+        // outage from a cold cache window.
+        $activity = $this->loadActivity($lookbackHours);
+
         $rows = [];
         $counters = [
             'applied' => 0,
             'dry_run' => 0,
             'skipped_no_samples' => 0,
             'skipped_low_samples' => 0,
+            'signal_idletime_only' => 0,
+            'signal_no_activity' => 0,
+            'signal_read_heavy' => 0,
+            'signal_write_heavy' => 0,
         ];
 
         foreach ($models as $modelClass => $tableName) {
@@ -135,6 +162,9 @@ final class CalibrateCommand extends Command
                     '-',
                     '-',
                     '-',
+                    '-',
+                    '-',
+                    '-',
                     $metrics['samples'] === 0
                         ? 'skipped (no cache entries)'
                         : sprintf('skipped (< %d samples)', $minSamples),
@@ -151,13 +181,36 @@ final class CalibrateCommand extends Command
             // would monotonically shrink TTL toward zero. Floor at half the previous
             // effective TTL so each calibration can move at most one octave down.
             $floor = $previousTtl > 0 ? (int) floor($previousTtl / 2) : 0;
-            $calibratedTtl = max($rawCalibrated, $floor);
+
+            $tableActivity = $activity[$tableName] ?? ['hit' => 0, 'miss' => 0, 'invalidate' => 0];
+            $reads = $tableActivity['hit'] + $tableActivity['miss'];
+            $writes = $tableActivity['invalidate'];
+            // hit_ratio = hits / reads. null = reads=0 (no signal — don't feed adjustment).
+            // Sample threshold (min_reads_for_signal) is enforced in adjustForActivity;
+            // here we only guard against division-by-zero.
+            $hitRatio = $reads > 0 ? $tableActivity['hit'] / $reads : null;
+
+            [$calibratedTtl, $signalSource] = $this->adjustForActivity(
+                $rawCalibrated,
+                $floor,
+                $reads,
+                $writes,
+                $hitRatio,
+                statsAvailable: $activity !== null,
+            );
+
+            $counters['signal_'.$signalSource]++;
 
             $persistedMetrics = array_merge($metrics, [
                 'previous_ttl' => $previousTtl,
                 'raw_calibrated' => $rawCalibrated,
                 'floor' => $floor,
                 'safety_factor' => $safetyFactor,
+                'reads' => $reads,
+                'writes' => $writes,
+                'hit_ratio' => $hitRatio,
+                'signal_source' => $signalSource,
+                'lookback_hours' => $lookbackHours,
             ]);
 
             if ($apply) {
@@ -173,13 +226,16 @@ final class CalibrateCommand extends Command
                 $metrics['samples'],
                 $metrics['p50'],
                 $metrics['p95'],
+                $reads,
+                $writes,
+                $signalSource,
                 $calibratedTtl,
                 $apply ? 'applied' : 'dry-run',
             ];
         }
 
         $this->table(
-            ['Model', 'Table', 'Samples', 'P50 (s)', 'P95 (s)', 'TTL (s)', 'Status'],
+            ['Model', 'Table', 'Samples', 'P50 (s)', 'P95 (s)', 'Reads', 'Writes', 'Signal', 'TTL (s)', 'Status'],
             $rows,
         );
 
@@ -194,10 +250,149 @@ final class CalibrateCommand extends Command
             'mode' => $apply ? 'apply' : 'dry-run',
             'safety_factor' => $safetyFactor,
             'min_samples' => $minSamples,
+            'lookback_hours' => $lookbackHours,
             'models_total' => count($models),
         ]);
 
         return self::SUCCESS;
+    }
+
+    /**
+     * Combine the IDLETIME-derived TTL with StatsCounter activity to pick a
+     * final value and label the signal source for downstream observability.
+     *
+     * $statsAvailable = false signals "Reader not configured OR Redis lookup
+     * failed" — both cases must be reported as 'idletime_only', not coalesced
+     * with the truly-empty-window 'no_activity' classification.
+     *
+     * On the read-heavy path, hit_ratio drives a convergent proportional
+     * controller that pulls TTL toward `target_hit_ratio`:
+     *   - adjustment = 1 + learning_rate × (target − actual)
+     *   - clamped to [1 − max_step, 1 + max_step] (bounded per-run change)
+     *   - |deviation| < deadband → no-op (oscillation guard around target)
+     *   - the survivor-bias floor still applies (previousTtl / 2)
+     * Combined, these three conditions form a bounded contraction map →
+     * geometric convergence to the target hit_ratio when IDLETIME is stable.
+     *
+     * @return array{0:int, 1:string} [adjustedTtl, signalSource]
+     */
+    private function adjustForActivity(int $rawCalibrated, int $floor, int $reads, int $writes, ?float $hitRatio, bool $statsAvailable): array
+    {
+        if (! $statsAvailable) {
+            return [max($rawCalibrated, $floor), 'idletime_only'];
+        }
+
+        $minReads = (int) config('lada-cache.calibration.min_reads_for_signal', 10);
+
+        if (($reads + $writes) < $minReads) {
+            // Too little observed traffic to draw a conclusion — preserve the
+            // IDLETIME-only behavior so we don't shrink TTLs on cold tables.
+            return [max($rawCalibrated, $floor), 'no_activity'];
+        }
+
+        // Clamp negative configs to 0 defensively. A negative threshold would
+        // make ($writes / $reads) >= $writeRatio universally true and collapse
+        // every table to write_heavy in a single cron run.
+        $writeRatio = max(0.0, (float) config('lada-cache.calibration.write_heavy_ratio', 0.5));
+
+        // reads=0 with writes>0 is degenerate (writes but no cache reads) — same
+        // treatment as write-heavy: invalidation dominates, extending TTL is waste.
+        $isWriteHeavy = $reads === 0
+            || ($writes > 0 && ($writes / $reads) >= $writeRatio);
+
+        if ($isWriteHeavy) {
+            // Skip the survivor-bias floor: writes are invalidating keys before
+            // their TTL fires anyway, so a longer TTL would only inflate memory
+            // without improving the hit ratio.
+            //
+            // BUT floor at 1: calibrated_ttl=0 means "persist forever" in Lada
+            // (Cache::set drops the EX argument), which is precisely the memory
+            // leak we want to avoid on write-heavy tables when an invalidation
+            // occasionally misses (raw SQL bypass, race, broken Observer, ...).
+            return [max($rawCalibrated, 1), 'write_heavy'];
+        }
+
+        // Read-heavy path — convergent hit_ratio proportional control.
+        // Adjustment is applied BEFORE floor; max(adj, floor) layers the
+        // hit_ratio signal on top without dropping the survivor-bias guard.
+        $adjusted = HitRatioAdjustment::apply(
+            $rawCalibrated,
+            $hitRatio,
+            (float) config('lada-cache.calibration.target_hit_ratio', 0.80),
+            (float) config('lada-cache.calibration.hit_ratio_deadband', 0.05),
+            (float) config('lada-cache.calibration.hit_ratio_learning_rate', 0.30),
+            (float) config('lada-cache.calibration.hit_ratio_max_step', 0.20),
+        );
+
+        return [max($adjusted, $floor), 'read_heavy'];
+    }
+
+    /**
+     * Surface a self-contradicting config where the operator asked us to look
+     * back further than StatsCounter retains data. Older buckets have already
+     * expired, so the pipeline reads return empty for the trailing keys.
+     * Non-fatal — keeps the run going under the actual data we have.
+     */
+    private function warnIfLookbackExceedsBucketTtl(int $lookbackHours): void
+    {
+        if ($lookbackHours <= 0 || $this->statsReader === null) {
+            return;
+        }
+
+        $bucketTtlSeconds = (int) config('lada-cache.stats.bucket_ttl_seconds', 86400 * 7);
+        $bucketTtlHours = (int) floor($bucketTtlSeconds / 3600);
+
+        if ($bucketTtlHours > 0 && $lookbackHours > $bucketTtlHours) {
+            $this->warn(sprintf(
+                'stats_lookback_hours (%d) exceeds bucket retention (%d h); older buckets have expired and will read empty.',
+                $lookbackHours,
+                $bucketTtlHours,
+            ));
+        }
+    }
+
+    /**
+     * One-shot activity load for the whole calibration run. Single pipelined
+     * Redis read for the lookback window.
+     *
+     * Returns:
+     *   - null  → stats signal unavailable: reader not configured, lookback=0,
+     *             OR Redis lookup threw. Caller labels these runs 'idletime_only'.
+     *   - []    → reached Redis, but no activity recorded in the window
+     *             (cold tables; operator hasn't enabled the counter yet).
+     *   - array → per-table activity counters.
+     *
+     * The null vs [] distinction matters: collapsing them would misclassify a
+     * Redis outage as "cold tables" and hide the failure from the signal
+     * counter histogram in the cron summary log.
+     *
+     * @return array<string, array{hit:int, miss:int, invalidate:int}>|null
+     */
+    private function loadActivity(int $lookbackHours): ?array
+    {
+        if ($this->statsReader === null || $lookbackHours <= 0) {
+            return null;
+        }
+
+        try {
+            return $this->statsReader->readAllActivity($lookbackHours);
+        } catch (Throwable $e) {
+            // Don't fail the whole calibration just because activity load broke.
+            // Operators still get the IDLETIME-driven TTL — they just lose the
+            // read/write adjustment for this run.
+            //
+            // report() so the exception lands in monitoring; cron stderr is
+            // often not captured by the scheduler in production deployments
+            // and a silent "warn" would mean we'd never know StatsReader is broken.
+            report($e);
+
+            $this->warn(sprintf(
+                'Activity stats unavailable (%s); falling back to IDLETIME-only signal.',
+                $e->getMessage(),
+            ));
+
+            return null;
+        }
     }
 
     /**
@@ -437,7 +632,7 @@ final class CalibrateCommand extends Command
      * instead of N synchronous calls. Falls back to sequential calls when the
      * underlying client does not expose a pipeline API.
      *
-     * @param  array<int, string> $keys
+     * @param  array<int, string>  $keys
      * @return array<int, int>
      */
     private function pipelinedIdleTimes(array $keys): array
@@ -472,7 +667,7 @@ final class CalibrateCommand extends Command
      * Issue OBJECT IDLETIME for each key in a single Redis pipeline round-trip
      * (PhpRedis or Predis). Returns raw command results aligned with input order.
      *
-     * @param  array<int, string> $chunk
+     * @param  array<int, string>  $chunk
      * @return array<int, mixed>
      */
     private function runIdleTimeBatch(mixed $client, array $chunk): array
@@ -515,7 +710,7 @@ final class CalibrateCommand extends Command
     }
 
     /**
-     * @param  array<int, int>                               $values
+     * @param  array<int, int>  $values
      * @return array{samples:int, p50:int, p95:int, max:int}
      */
     private function computePercentiles(array $values): array
@@ -537,7 +732,7 @@ final class CalibrateCommand extends Command
     }
 
     /**
-     * @param array<int, int> $sortedValues
+     * @param  array<int, int>  $sortedValues
      */
     private function percentile(array $sortedValues, int $percentile): int
     {
