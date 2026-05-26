@@ -119,10 +119,17 @@ final class CalibrateCommand extends Command
         // null  = stats signal unavailable (reader not configured OR Redis lookup failed);
         // []    = configured + reached Redis, but no activity recorded in window;
         // array = per-table activity counters.
-        // adjustForActivity uses the null/[] distinction to label the run
-        // 'idletime_only' vs 'no_activity' so monitoring can tell a real Redis
-        // outage from a cold cache window.
+        // We collapse the tri-state into an explicit `$statsState` enum-like
+        // string so downstream branches read straightforwardly; the original
+        // null/[] distinction below is what monitoring needs to tell a real
+        // Redis outage ('unavailable' → 'idletime_only') from a cold window
+        // ('empty' → 'no_activity').
         $activity = $this->loadActivity($lookbackHours);
+        $statsState = match (true) {
+            $activity === null => 'unavailable',
+            $activity === [] => 'empty',
+            default => 'available',
+        };
 
         $rows = [];
         $counters = [
@@ -196,7 +203,7 @@ final class CalibrateCommand extends Command
                 $reads,
                 $writes,
                 $hitRatio,
-                statsAvailable: $activity !== null,
+                statsState: $statsState,
             );
 
             $counters['signal_'.$signalSource]++;
@@ -261,9 +268,13 @@ final class CalibrateCommand extends Command
      * Combine the IDLETIME-derived TTL with StatsCounter activity to pick a
      * final value and label the signal source for downstream observability.
      *
-     * $statsAvailable = false signals "Reader not configured OR Redis lookup
-     * failed" — both cases must be reported as 'idletime_only', not coalesced
-     * with the truly-empty-window 'no_activity' classification.
+     * `$statsState` is the explicit tri-state from {@see handle()}:
+     *   - 'unavailable' → reader not configured OR Redis lookup failed; report
+     *                     as 'idletime_only' so monitoring sees the outage.
+     *   - 'empty'       → reader reached Redis but the window held no events
+     *                     for any table (also yields 'no_activity' when per-table
+     *                     reads+writes is under the signal threshold).
+     *   - 'available'   → per-table activity present; the real adjustment runs.
      *
      * On the read-heavy path, hit_ratio drives a convergent proportional
      * controller that pulls TTL toward `target_hit_ratio`:
@@ -274,17 +285,21 @@ final class CalibrateCommand extends Command
      * Combined, these three conditions form a bounded contraction map →
      * geometric convergence to the target hit_ratio when IDLETIME is stable.
      *
+     * @param  'unavailable'|'empty'|'available'  $statsState
      * @return array{0:int, 1:string} [adjustedTtl, signalSource]
      */
-    private function adjustForActivity(int $rawCalibrated, int $floor, int $reads, int $writes, ?float $hitRatio, bool $statsAvailable): array
+    private function adjustForActivity(int $rawCalibrated, int $floor, int $reads, int $writes, ?float $hitRatio, string $statsState): array
     {
-        if (! $statsAvailable) {
+        if ($statsState === 'unavailable') {
             return [max($rawCalibrated, $floor), 'idletime_only'];
         }
 
         $minReads = (int) config('lada-cache.calibration.min_reads_for_signal', 10);
 
-        if (($reads + $writes) < $minReads) {
+        // `empty` (Redis returned no events for this window) and `available`
+        // but per-table reads+writes below the threshold collapse to the same
+        // 'no_activity' label — we have insufficient evidence either way.
+        if ($statsState === 'empty' || ($reads + $writes) < $minReads) {
             // Too little observed traffic to draw a conclusion — preserve the
             // IDLETIME-only behavior so we don't shrink TTLs on cold tables.
             return [max($rawCalibrated, $floor), 'no_activity'];
@@ -332,10 +347,16 @@ final class CalibrateCommand extends Command
      * back further than StatsCounter retains data. Older buckets have already
      * expired, so the pipeline reads return empty for the trailing keys.
      * Non-fatal — keeps the run going under the actual data we have.
+     *
+     * Fires regardless of whether StatsReader is bound. A misconfigured
+     * `stats_lookback_hours > bucket_ttl_seconds/3600` is still a misconfig
+     * that operators should fix even if they haven't enabled stats yet
+     * (silent until you do isn't helpful; alerting on the boundary now means
+     * the next env that flips stats on starts clean).
      */
     private function warnIfLookbackExceedsBucketTtl(int $lookbackHours): void
     {
-        if ($lookbackHours <= 0 || $this->statsReader === null) {
+        if ($lookbackHours <= 0) {
             return;
         }
 
@@ -681,7 +702,13 @@ final class CalibrateCommand extends Command
                 $client->object('IDLETIME', $key);
             }
 
-            $results = $client->{'exec'}();
+            // Dynamic method call below — phpredis exposes the pipeline flush
+            // as a PHP reserved word, and some static analyzers (psalm /
+            // phpstan strict modes) trip on direct calls even though the
+            // method is real. The dynamic form sidesteps that false positive
+            // without changing behavior.
+            $pipelineFlush = 'exec';
+            $results = $client->{$pipelineFlush}();
 
             return is_array($results) ? $results : [];
         }

@@ -41,8 +41,12 @@ final readonly class StatsReader
      * Action labels emitted by {@see QueryHandler::dispatchActivity()}.
      * Kept in sync with that call site so unrecognized fields are ignored
      * rather than silently summed into a bucket they don't belong to.
+     *
+     * Note: no `array` type on the constant — typed class constants require
+     * PHP 8.3+ and we want to keep the package compatible with older runtimes
+     * that still satisfy `^8.1` in downstream apps consuming this package.
      */
-    private const array DEFAULT_ACTIONS = ['hit', 'miss', 'invalidate'];
+    private const DEFAULT_ACTIONS = ['hit', 'miss', 'invalidate'];
 
     public function __construct(
         private Redis $redis,
