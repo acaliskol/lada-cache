@@ -111,6 +111,10 @@ final readonly class StatsReader
      * Prefixed bucket keys covering the lookback window. Inclusive of the
      * current hour bucket (where in-flight events still accumulate).
      *
+     * UTC bucket key (`gmdate`) — must match the writer's format in
+     * {@see StatsCounter::bucketKey()} so we don't
+     * miss buckets when writer / reader run in different server timezones.
+     *
      * @return string[]
      */
     private function bucketKeysForLookback(int $hoursBack): array
@@ -119,7 +123,7 @@ final readonly class StatsReader
         $keys = [];
 
         for ($i = 0; $i < $hoursBack; $i++) {
-            $hour = date('YmdH', $now - ($i * 3600));
+            $hour = gmdate('YmdH', $now - ($i * 3600));
             $keys[] = $this->redis->prefix('lada:stats:'.$hour);
         }
 

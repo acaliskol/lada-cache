@@ -4,9 +4,6 @@ declare(strict_types=1);
 
 namespace Spiritix\LadaCache\Events;
 
-use Spiritix\LadaCache\Console\CalibrateCommand;
-use Spiritix\LadaCache\Stats\StatsCounter;
-
 /**
  * Lada Cache activity event — dispatched on cache hit / miss / invalidate.
  *
@@ -26,9 +23,9 @@ use Spiritix\LadaCache\Stats\StatsCounter;
  *       );
  *   });
  *
- * The bundled {@see StatsCounter} listener provides a
- * production-ready buffered counter that periodically writes per-table HASH
- * buckets to Redis — useful as a calibrate-time input to {@see CalibrateCommand}.
+ * See LadaCacheServiceProvider for listener wiring (StatsCounter is the
+ * bundled production-ready listener; CalibrateCommand consumes the resulting
+ * per-table HASH buckets via StatsReader).
  */
 final class LadaCacheActivity
 {

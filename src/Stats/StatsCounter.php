@@ -36,7 +36,13 @@ use Throwable;
  *
  * Failure mode: a flush exception is caught and the pending counters are
  * restored so the next flush retries the lost batch. Telemetry must never
- * break a request.
+ * break a request. A sustained outage is bounded by `$maxPendingSize` —
+ * the oldest entries are dropped (with an error log) before the buffer
+ * can OOM the worker.
+ *
+ * Note: this class is intentionally NOT marked `readonly` at the class level
+ * because the `$pending` buffer is mutated on every event. Constructor
+ * parameters remain individually `readonly`.
  */
 final class StatsCounter
 {
@@ -50,6 +56,11 @@ final class StatsCounter
         private readonly int $maxBatchSize = 100,
         private readonly float $maxIntervalSeconds = 5.0,
         private readonly int $bucketTtlSeconds = 86400 * 7,
+        // Hard cap on `$pending` size. If Redis is unreachable for long enough
+        // that the restore-on-failure path keeps growing the buffer, oldest
+        // entries are dropped and an error is logged. Without this guard a
+        // stuck flush path could OOM the worker under heavy hit/miss traffic.
+        private readonly int $maxPendingSize = 10000,
     ) {
         $this->lastFlush = microtime(true);
     }
@@ -81,6 +92,8 @@ final class StatsCounter
 
         try {
             $bucket = $this->bucketKey();
+            // TTL is captured at construction time and re-passed into the
+            // pipeline closure to avoid re-reading config in the hot path.
             $ttl = $this->bucketTtlSeconds;
 
             $this->redis->pipeline(static function ($pipe) use ($bucket, $batch, $ttl): void {
@@ -96,7 +109,37 @@ final class StatsCounter
             foreach ($batch as $field => $count) {
                 $this->pending[$field] = ($this->pending[$field] ?? 0) + $count;
             }
+
+            $this->enforceMaxPendingSize();
         }
+    }
+
+    /**
+     * Drop the oldest entries from `$pending` if the buffer is over the
+     * configured cap after a failed flush restored its batch. Without this
+     * a sustained Redis outage would OOM the worker on a high-traffic site.
+     */
+    private function enforceMaxPendingSize(): void
+    {
+        if ($this->maxPendingSize <= 0) {
+            return;
+        }
+
+        $excess = count($this->pending) - $this->maxPendingSize;
+
+        if ($excess <= 0) {
+            return;
+        }
+
+        // PHP arrays preserve insertion order, so slicing from the start drops
+        // the oldest (table:action) keys first.
+        $this->pending = array_slice($this->pending, $excess, null, true);
+
+        Log::error(sprintf(
+            '[LadaCache] StatsCounter overflow — dropped %d entries (cap=%d). Redis flush is failing; investigate.',
+            $excess,
+            $this->maxPendingSize,
+        ));
     }
 
     /**
@@ -114,6 +157,13 @@ final class StatsCounter
         // Apply Lada's configured prefix so the bucket sits alongside other
         // Lada-owned Redis keys (and tests asserting against the expected key
         // via Redis::prefix() can find it).
-        return $this->redis->prefix('lada:stats:'.date('YmdH'));
+        //
+        // UTC bucket key (`gmdate`) — server timezone drift would otherwise
+        // produce different bucket names on writer and reader if they happen
+        // to run with different `date.timezone` settings (e.g. two workers
+        // started in different containers, or scheduler running on a host
+        // with a non-UTC clock). StatsReader uses the same `gmdate('YmdH')`
+        // format for symmetry.
+        return $this->redis->prefix('lada:stats:'.gmdate('YmdH'));
     }
 }
