@@ -4,10 +4,13 @@ declare(strict_types=1);
 
 namespace Spiritix\LadaCache\Tests\Unit\Stats;
 
+use Illuminate\Redis\Connections\Connection;
+use Mockery;
 use Spiritix\LadaCache\Events\LadaCacheActivity;
 use Spiritix\LadaCache\Redis;
 use Spiritix\LadaCache\Stats\StatsCounter;
 use Spiritix\LadaCache\Tests\TestCase;
+use Throwable;
 
 /**
  * Unit-level checks for {@see StatsCounter}.
@@ -58,7 +61,7 @@ class StatsCounterTest extends TestCase
 
         $counter->flush();
 
-        $bucket = $this->redis->prefix('lada:stats:'.date('YmdH'));
+        $bucket = $this->redis->prefix('lada:stats:'.gmdate('YmdH'));
 
         $this->assertSame('2', (string) $this->redis->hget($bucket, 'users:hit'));
         $this->assertSame('1', (string) $this->redis->hget($bucket, 'orders:invalidate'));
@@ -84,7 +87,7 @@ class StatsCounterTest extends TestCase
 
         $this->assertSame([], $counter->pending(), 'auto-flush should fire when distinct field count reaches batch size');
 
-        $bucket = $this->redis->prefix('lada:stats:'.date('YmdH'));
+        $bucket = $this->redis->prefix('lada:stats:'.gmdate('YmdH'));
         $this->assertSame('1', (string) $this->redis->hget($bucket, 'users:hit'));
         $this->assertSame('1', (string) $this->redis->hget($bucket, 'orders:hit'));
         $this->assertSame('1', (string) $this->redis->hget($bucket, 'cities:hit'));
@@ -105,7 +108,7 @@ class StatsCounterTest extends TestCase
 
         $this->assertSame([], $counter->pending(), 'interval threshold should auto-flush both pending events');
 
-        $bucket = $this->redis->prefix('lada:stats:'.date('YmdH'));
+        $bucket = $this->redis->prefix('lada:stats:'.gmdate('YmdH'));
         $this->assertSame('1', (string) $this->redis->hget($bucket, 'users:hit'));
         $this->assertSame('1', (string) $this->redis->hget($bucket, 'orders:hit'));
     }
@@ -131,7 +134,7 @@ class StatsCounterTest extends TestCase
 
         $counter->flush();
 
-        $bucket = $this->redis->prefix('lada:stats:'.date('YmdH'));
+        $bucket = $this->redis->prefix('lada:stats:'.gmdate('YmdH'));
         $this->assertSame('50', (string) $this->redis->hget($bucket, 'users:hit'));
     }
 
@@ -141,8 +144,107 @@ class StatsCounterTest extends TestCase
 
         $counter->flush();
 
-        $bucket = $this->redis->prefix('lada:stats:'.date('YmdH'));
+        $bucket = $this->redis->prefix('lada:stats:'.gmdate('YmdH'));
         $this->assertSame(0, (int) $this->redis->exists($bucket), 'no Redis key should be created for an empty flush');
+    }
+
+    public function test_bucket_key_uses_utc_to_avoid_tz_drift(): void
+    {
+        // Writer should produce the UTC YYYYMMDDHH bucket so that a reader on
+        // a host with a different `date.timezone` still finds the same key.
+        // Regression test for the `date()` → `gmdate()` switch.
+        $counter = $this->makeCounter(maxBatchSize: 1000, maxIntervalSeconds: 1000.0);
+
+        $counter->handle($this->event('hit', 'users'));
+        $counter->flush();
+
+        $utcBucket = $this->redis->prefix('lada:stats:'.gmdate('YmdH'));
+        $this->assertSame(1, (int) $this->redis->exists($utcBucket), 'bucket key must use gmdate(YmdH)');
+        $this->assertSame('1', (string) $this->redis->hget($utcBucket, 'users:hit'));
+    }
+
+    public function test_pipeline_failure_restores_pending_for_retry(): void
+    {
+        // Mock the underlying Connection (Redis itself is final readonly).
+        // pipeline() throws so we can observe the restore path: the next
+        // flush should retry the same batch.
+        $callCount = 0;
+        $redis = $this->redisWithFailingPipeline(function () use (&$callCount): void {
+            $callCount++;
+            throw new \RuntimeException('redis down');
+        });
+
+        $counter = new StatsCounter($redis, maxBatchSize: 1000, maxIntervalSeconds: 1000.0);
+        $counter->handle(new LadaCacheActivity('hit', 'k', [], 'users'));
+        $counter->handle(new LadaCacheActivity('miss', 'k', [], 'users'));
+
+        try {
+            $counter->flush();
+        } catch (Throwable) {
+            // The implementation must swallow flush exceptions; if it
+            // re-throws, the assertion below will catch the regression.
+        }
+
+        $this->assertSame(1, $callCount, 'pipeline was called once');
+        $this->assertSame(
+            ['users:hit' => 1, 'users:miss' => 1],
+            $counter->pending(),
+            'failed flush must restore the batch into pending so the next flush retries it',
+        );
+    }
+
+    public function test_overflow_drops_oldest_when_pending_exceeds_cap(): void
+    {
+        // Force the restore-on-failure path repeatedly with a tiny cap so we
+        // can observe oldest-first eviction without seeding 10k entries.
+        $redis = $this->redisWithFailingPipeline(static function (): void {
+            throw new \RuntimeException('redis still down');
+        });
+
+        $counter = new StatsCounter(
+            $redis,
+            maxBatchSize: 1000,
+            maxIntervalSeconds: 1000.0,
+            bucketTtlSeconds: 3600,
+            maxPendingSize: 3,
+        );
+
+        // Insert 5 distinct fields; pipeline fails each time we flush, the
+        // restore-on-failure path puts them all back into pending, then the
+        // overflow guard trims the oldest 2.
+        $tables = ['a', 'b', 'c', 'd', 'e'];
+        foreach ($tables as $table) {
+            $counter->handle(new LadaCacheActivity('hit', 'k', [], $table));
+        }
+        $counter->flush();
+
+        $remaining = $counter->pending();
+        $this->assertCount(3, $remaining, 'pending must be trimmed to maxPendingSize');
+        $this->assertSame(
+            ['c:hit', 'd:hit', 'e:hit'],
+            array_keys($remaining),
+            'oldest entries must be dropped first (PHP array insertion order)',
+        );
+    }
+
+    /**
+     * Build a real Redis proxy around a stub Connection whose pipeline()
+     * invokes the supplied callback (typically throwing). Used to drive the
+     * restore-on-failure / overflow paths deterministically without touching
+     * a live Redis instance.
+     */
+    private function redisWithFailingPipeline(\Closure $onPipeline): Redis
+    {
+        $connection = Mockery::mock(Connection::class);
+        $connection->shouldReceive('pipeline')->andReturnUsing($onPipeline);
+
+        return new Redis($connection);
+    }
+
+    protected function tearDown(): void
+    {
+        Mockery::close();
+        parent::tearDown();
     }
 
     private function makeCounter(
