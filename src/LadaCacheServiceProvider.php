@@ -16,6 +16,7 @@ use Illuminate\Database\SqliteConnection;
 use Illuminate\Database\SqlServerConnection;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\ServiceProvider;
+use Laravel\Octane\Events\RequestHandled;
 use Spiritix\LadaCache\Calibration\TtlCalibrationRepository;
 use Spiritix\LadaCache\Console\CalibrateCommand;
 use Spiritix\LadaCache\Console\DisableCommand;
@@ -94,8 +95,22 @@ final class LadaCacheServiceProvider extends ServiceProvider
                 $counter->handle($event);
             });
 
-            // Final flush at app shutdown so the trailing batch isn't lost.
-            // Works under FPM (per-request), Octane (per-worker-shutdown), and CLI.
+            // Dual flush hook for the trailing batch:
+            //
+            //   - FPM / CLI:      Application::terminating() fires per-request /
+            //                     once before the worker exits. Per-request under
+            //                     FPM because each request rebuilds the kernel.
+            //   - Octane (Swoole/RoadRunner/FrankenPHP):
+            //                     Application::terminating() fires once at
+            //                     **worker shutdown**, NOT per-request. Without
+            //                     the RequestHandled listener below, the
+            //                     in-memory buffer could persist for minutes or
+            //                     hours and be lost on a worker crash / OOM /
+            //                     graceful restart. The Octane-specific event
+            //                     gives us a per-request boundary equivalent to
+            //                     the FPM lifecycle.
+            //
+            // Both listeners are idempotent: an empty buffer is a no-op.
             $this->app->terminating(static function (): void {
                 if (! app()->bound('lada.stats_counter')) {
                     return;
@@ -105,6 +120,21 @@ final class LadaCacheServiceProvider extends ServiceProvider
                 $counter = app('lada.stats_counter');
                 $counter->flush();
             });
+
+            // Defensive class_exists() so the package doesn't require
+            // laravel/octane as a hard dependency — non-Octane apps simply skip
+            // the registration.
+            if (class_exists(RequestHandled::class)) {
+                $events->listen(RequestHandled::class, static function (): void {
+                    if (! app()->bound('lada.stats_counter')) {
+                        return;
+                    }
+
+                    /** @var StatsCounter $counter */
+                    $counter = app('lada.stats_counter');
+                    $counter->flush();
+                });
+            }
         }
 
         // Auto-register the calibration cron when enabled and a schedule expression is set.
