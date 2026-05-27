@@ -6,6 +6,7 @@ namespace Spiritix\LadaCache\Console;
 
 use Illuminate\Console\Command;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Support\Facades\Config;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Log;
 use InvalidArgumentException;
@@ -111,10 +112,10 @@ final class CalibrateCommand extends Command
             return self::INVALID;
         }
 
-        $minSamples = (int) config('lada-cache.calibration.min_samples', 50);
+        $minSamples = Config::integer('lada-cache.calibration.min_samples', 50);
         $apply = (bool) $this->option('apply');
 
-        $lookbackHours = (int) config('lada-cache.calibration.stats_lookback_hours', 168);
+        $lookbackHours = Config::integer('lada-cache.calibration.stats_lookback_hours', 168);
         $this->warnIfLookbackExceedsBucketTtl($lookbackHours);
         // null  = stats signal unavailable (reader not configured OR Redis lookup failed);
         // []    = configured + reached Redis, but no activity recorded in window;
@@ -145,7 +146,7 @@ final class CalibrateCommand extends Command
 
         // Pending --apply rows are buffered and flushed in `$batchSize` chunks so we issue
         // O(models / batchSize) bulk UPSERTs instead of N single-row queries.
-        $batchSize = max(1, (int) config('lada-cache.calibration.batch_size', 100));
+        $batchSize = max(1, Config::integer('lada-cache.calibration.batch_size', 100));
         $pending = [];
 
         foreach ($models as $modelClass => $tableName) {
@@ -315,7 +316,7 @@ final class CalibrateCommand extends Command
             return [max($rawCalibrated, $floor), 'idletime_only'];
         }
 
-        $minReads = (int) config('lada-cache.calibration.min_reads_for_signal', 10);
+        $minReads = Config::integer('lada-cache.calibration.min_reads_for_signal', 10);
 
         // `empty` (Redis returned no events for this window) and `available`
         // but per-table reads+writes below the threshold collapse to the same
@@ -329,7 +330,7 @@ final class CalibrateCommand extends Command
         // Clamp negative configs to 0 defensively. A negative threshold would
         // make ($writes / $reads) >= $writeRatio universally true and collapse
         // every table to write_heavy in a single cron run.
-        $writeRatio = max(0.0, (float) config('lada-cache.calibration.write_heavy_ratio', 0.5));
+        $writeRatio = max(0.0, Config::float('lada-cache.calibration.write_heavy_ratio', 0.5));
 
         // reads=0 with writes>0 is degenerate (writes but no cache reads) — same
         // treatment as write-heavy: invalidation dominates, extending TTL is waste.
@@ -354,10 +355,10 @@ final class CalibrateCommand extends Command
         $adjusted = HitRatioAdjustment::apply(
             $rawCalibrated,
             $hitRatio,
-            (float) config('lada-cache.calibration.target_hit_ratio', 0.80),
-            (float) config('lada-cache.calibration.hit_ratio_deadband', 0.05),
-            (float) config('lada-cache.calibration.hit_ratio_learning_rate', 0.30),
-            (float) config('lada-cache.calibration.hit_ratio_max_step', 0.20),
+            Config::float('lada-cache.calibration.target_hit_ratio', 0.80),
+            Config::float('lada-cache.calibration.hit_ratio_deadband', 0.05),
+            Config::float('lada-cache.calibration.hit_ratio_learning_rate', 0.30),
+            Config::float('lada-cache.calibration.hit_ratio_max_step', 0.20),
         );
 
         return [max($adjusted, $floor), 'read_heavy'];
@@ -381,7 +382,7 @@ final class CalibrateCommand extends Command
             return;
         }
 
-        $bucketTtlSeconds = (int) config('lada-cache.stats.bucket_ttl_seconds', 86400 * 7);
+        $bucketTtlSeconds = Config::integer('lada-cache.stats.bucket_ttl_seconds', 86400 * 7);
         $bucketTtlHours = (int) floor($bucketTtlSeconds / 3600);
 
         if ($bucketTtlHours > 0 && $lookbackHours > $bucketTtlHours) {
@@ -456,7 +457,7 @@ final class CalibrateCommand extends Command
             return $value;
         }
 
-        return (float) config('lada-cache.calibration.safety_factor', 2.0);
+        return Config::float('lada-cache.calibration.safety_factor', 2.0);
     }
 
     /**
@@ -479,7 +480,7 @@ final class CalibrateCommand extends Command
             return (int) $modelTtls[$modelClass];
         }
 
-        return (int) config('lada-cache.expiration_time', 0);
+        return Config::integer('lada-cache.expiration_time', 0);
     }
 
     private function isIdleTimeSupported(): bool
@@ -694,7 +695,7 @@ final class CalibrateCommand extends Command
             }
 
             foreach ($raw as $idle) {
-                if ($idle === false || $idle === null) {
+                if (! is_numeric($idle)) {
                     continue;
                 }
 

@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Spiritix\LadaCache\Calibration;
 
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Config;
 use Illuminate\Support\Facades\DB;
 
 /**
@@ -96,14 +97,20 @@ final class TtlCalibrationRepository
      */
     private function map(): array
     {
-        $ttl = (int) config('lada-cache.calibration.cache_ttl', 300);
+        $ttl = Config::integer('lada-cache.calibration.cache_ttl', 300);
 
-        return Cache::remember(self::CACHE_KEY, $ttl, function (): array {
-            return DB::table($this->tableName)
+        /** @var array<class-string, int> $cached */
+        $cached = Cache::remember(self::CACHE_KEY, $ttl, function (): array {
+            /** @var array<class-string, int> $rows */
+            $rows = DB::table($this->tableName)
                 ->select(['model_class', 'calibrated_ttl'])
                 ->pluck('calibrated_ttl', 'model_class')
-                ->map(static fn ($v): int => (int) $v)
+                ->map(static fn ($v): int => is_numeric($v) ? (int) $v : 0)
                 ->all();
+
+            return $rows;
         });
+
+        return $cached;
     }
 }
