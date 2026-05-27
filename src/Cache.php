@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Spiritix\LadaCache;
 
+use Illuminate\Support\Facades\Config;
 use Illuminate\Support\Facades\Log;
 use Throwable;
 
@@ -28,8 +29,7 @@ final class Cache
         private readonly Encoder $encoder,
         ?int $expirationTime = null,
     ) {
-        $configTtl = config('lada-cache.expiration_time', 0);
-        $this->expirationTime = $expirationTime ?? (is_numeric($configTtl) ? (int) $configTtl : 0);
+        $this->expirationTime = $expirationTime ?? Config::integer('lada-cache.expiration_time', 0);
     }
 
     public function has(string $key): bool
@@ -90,6 +90,8 @@ final class Cache
     public function flush(): void
     {
         try {
+            // `database.redis.options.prefix` may be `false` (legacy "no prefix") in addition to
+            // null / empty string / string — `Config::string()` is too strict here.
             $rawPrefix = config('database.redis.options.prefix');
             $connectionPrefix = is_string($rawPrefix) ? $rawPrefix : '';
 
