@@ -14,12 +14,14 @@ use Spiritix\LadaCache\Redis;
 use Spiritix\LadaCache\Reflector;
 use Spiritix\LadaCache\Tagger;
 use Spiritix\LadaCache\Tests\TestCase;
+use Spiritix\LadaCache\TtlResolver;
 
 class QueryHandlerTest extends TestCase
 {
     private Redis $redis;
     private Cache $cache;
     private Invalidator $invalidator;
+    private TtlResolver $ttlResolver;
 
     protected function setUp(): void
     {
@@ -30,11 +32,12 @@ class QueryHandlerTest extends TestCase
         $this->redis = new Redis();
         $this->cache = new Cache($this->redis, new Encoder(), 0);
         $this->invalidator = new Invalidator($this->redis);
+        $this->ttlResolver = new TtlResolver();
     }
 
     public function testCacheQueryMissStoresResultAndTags(): void
     {
-        $handler = new QueryHandler($this->cache, $this->invalidator);
+        $handler = new QueryHandler($this->cache, $this->invalidator, $this->ttlResolver);
         $builder = DB::table('cars');
         $handler->setBuilder($builder);
 
@@ -59,7 +62,7 @@ class QueryHandlerTest extends TestCase
 
     public function testCacheQueryHitReadsCachedValueAndRepairsTags(): void
     {
-        $handler = new QueryHandler($this->cache, $this->invalidator);
+        $handler = new QueryHandler($this->cache, $this->invalidator, $this->ttlResolver);
         $builder = DB::table('cars');
         $handler->setBuilder($builder);
 
