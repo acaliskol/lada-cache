@@ -125,6 +125,10 @@ return [
         'min_samples' => (int) env('LADA_CACHE_CALIBRATION_MIN_SAMPLES', 50),
         'cache_ttl' => (int) env('LADA_CACHE_CALIBRATION_CACHE_TTL', 300),
 
+        // How many --apply rows to buffer before issuing a single bulk UPSERT.
+        // With ~500 cached models a batch of 100 reduces DB round-trips ~5x.
+        'batch_size' => (int) env('LADA_CACHE_CALIBRATION_BATCH_SIZE', 100),
+
         // Cron expression for the auto-scheduled calibration run. Empty string disables
         // the auto-schedule (you can still invoke `php artisan lada-cache:calibrate --apply`
         // manually or register it yourself in `routes/console.php`).
