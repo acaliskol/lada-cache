@@ -37,22 +37,47 @@ final class TtlCalibrationRepository
     /**
      * Persist (upsert) a single calibration row and bust the cache.
      *
-     * @param array<string, mixed> $metrics
+     * @param  array<string, mixed>  $metrics
      */
     public function upsert(string $modelClass, string $tableName, int $calibratedTtl, array $metrics): void
     {
-        $now = now();
+        $this->upsertMany([[
+            'model_class' => $modelClass,
+            'table_name' => $tableName,
+            'calibrated_ttl' => $calibratedTtl,
+            'metrics' => $metrics,
+        ]]);
+    }
 
-        DB::table($this->tableName)->updateOrInsert(
-            ['model_class' => $modelClass],
-            [
-                'table_name' => $tableName,
-                'calibrated_ttl' => $calibratedTtl,
-                'metrics' => json_encode($metrics, JSON_THROW_ON_ERROR),
-                'calibrated_at' => $now,
-                'updated_at' => $now,
-                'created_at' => $now,
-            ],
+    /**
+     * Persist multiple calibrations in a single SQL statement and bust the cache once.
+     *
+     * Each row: `['model_class' => string, 'table_name' => string, 'calibrated_ttl' => int, 'metrics' => array]`.
+     * Empty input is a no-op (no DB round-trip, no cache bust).
+     *
+     * @param  list<array{model_class: string, table_name: string, calibrated_ttl: int, metrics: array<string, mixed>}>  $rows
+     */
+    public function upsertMany(array $rows): void
+    {
+        if ($rows === []) {
+            return;
+        }
+
+        $now = now();
+        $values = array_map(static fn (array $row): array => [
+            'model_class' => $row['model_class'],
+            'table_name' => $row['table_name'],
+            'calibrated_ttl' => $row['calibrated_ttl'],
+            'metrics' => json_encode($row['metrics'], JSON_THROW_ON_ERROR),
+            'calibrated_at' => $now,
+            'updated_at' => $now,
+            'created_at' => $now,
+        ], $rows);
+
+        DB::table($this->tableName)->upsert(
+            $values,
+            ['model_class'],
+            ['table_name', 'calibrated_ttl', 'metrics', 'calibrated_at', 'updated_at'],
         );
 
         $this->bust();
@@ -78,8 +103,7 @@ final class TtlCalibrationRepository
                 ->select(['model_class', 'calibrated_ttl'])
                 ->pluck('calibrated_ttl', 'model_class')
                 ->map(static fn ($v): int => (int) $v)
-                ->all()
-            ;
+                ->all();
         });
     }
 }

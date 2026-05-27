@@ -143,6 +143,11 @@ final class CalibrateCommand extends Command
             'signal_write_heavy' => 0,
         ];
 
+        // Pending --apply rows are buffered and flushed in `$batchSize` chunks so we issue
+        // O(models / batchSize) bulk UPSERTs instead of N single-row queries.
+        $batchSize = max(1, (int) config('lada-cache.calibration.batch_size', 100));
+        $pending = [];
+
         foreach ($models as $modelClass => $tableName) {
             $metrics = $this->collectMetrics($tableName);
 
@@ -221,7 +226,18 @@ final class CalibrateCommand extends Command
             ]);
 
             if ($apply) {
-                $this->repository->upsert($modelClass, $tableName, $calibratedTtl, $persistedMetrics);
+                $pending[] = [
+                    'model_class' => $modelClass,
+                    'table_name' => $tableName,
+                    'calibrated_ttl' => $calibratedTtl,
+                    'metrics' => $persistedMetrics,
+                ];
+
+                if (count($pending) >= $batchSize) {
+                    $this->repository->upsertMany($pending);
+                    $pending = [];
+                }
+
                 $counters['applied']++;
             } else {
                 $counters['dry_run']++;
@@ -239,6 +255,11 @@ final class CalibrateCommand extends Command
                 $calibratedTtl,
                 $apply ? 'applied' : 'dry-run',
             ];
+        }
+
+        // Residual rows that didn't fill the final batch.
+        if ($pending !== []) {
+            $this->repository->upsertMany($pending);
         }
 
         $this->table(
