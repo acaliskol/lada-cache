@@ -28,7 +28,8 @@ final class Cache
         private readonly Encoder $encoder,
         ?int $expirationTime = null,
     ) {
-        $this->expirationTime = $expirationTime ?? (int) config('lada-cache.expiration_time', 0);
+        $configTtl = config('lada-cache.expiration_time', 0);
+        $this->expirationTime = $expirationTime ?? (is_numeric($configTtl) ? (int) $configTtl : 0);
     }
 
     public function has(string $key): bool
@@ -44,7 +45,7 @@ final class Cache
      *   - $ttl = 0  : SET key value (no expiration — persist forever, rely on tag invalidation)
      *   - $ttl null : fall back to the global expirationTime (which itself follows the same > 0 / = 0 rule)
      *
-     * @param array<string> $tags
+     * @param  array<string>  $tags
      */
     public function set(string $key, array $tags, mixed $data, ?int $ttl = null): void
     {
@@ -70,6 +71,9 @@ final class Cache
         return $encoded === null ? null : $this->encoder->decode($encoded);
     }
 
+    /**
+     * @param  array<string>  $tags
+     */
     public function repairTagMembership(string $key, array $tags): void
     {
         $prefixedKey = $this->redis->prefix($key);
@@ -86,7 +90,8 @@ final class Cache
     public function flush(): void
     {
         try {
-            $connectionPrefix = (string) (config('database.redis.options.prefix') ?? '');
+            $rawPrefix = config('database.redis.options.prefix');
+            $connectionPrefix = is_string($rawPrefix) ? $rawPrefix : '';
 
             // Fetch all Lada keys as returned by the connection (includes connection prefix if set)
             $keys = $this->redis->keys($this->redis->prefix('*'));
@@ -95,7 +100,7 @@ final class Cache
                 // Strip the connection-level prefix so the driver applies it exactly once when deleting
                 $toDelete = $connectionPrefix !== ''
                     ? array_map(
-                        static fn(string $k): string => str_starts_with($k, $connectionPrefix) ? substr($k, strlen($connectionPrefix)) : $k,
+                        static fn (string $k): string => str_starts_with($k, $connectionPrefix) ? substr($k, strlen($connectionPrefix)) : $k,
                         $keys
                     )
                     : $keys;

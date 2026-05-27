@@ -20,6 +20,23 @@ use Illuminate\Support\Facades\Redis as RedisFacade;
  * - Keys should be prefixed using `prefix()` before being written to Redis to avoid
  *   collisions with application keys.
  * - The class is marked `readonly` as its state is fully defined at construction.
+ *
+ * The `@method` declarations below expose forwarded Redis commands to static
+ * analyzers (PHPStan/Larastan). PHP runtime dispatch is unaffected.
+ *
+ * @method mixed set(string $key, mixed $value, mixed ...$options)
+ * @method string|null get(string $key)
+ * @method int sadd(string $key, mixed ...$members)
+ * @method int srem(string $key, mixed ...$members)
+ * @method int sismember(string $key, mixed $member)
+ * @method array<int, string> smembers(string $key)
+ * @method array<int, string> keys(string $pattern)
+ * @method int del(string ...$keys)
+ * @method int unlink(string ...$keys)
+ * @method int exists(string ...$keys)
+ * @method mixed multi(?callable $callback = null)
+ * @method array<int, mixed> exec()
+ * @method array<int, mixed> pipeline(?callable $callback = null)
  */
 final readonly class Redis
 {
