@@ -82,8 +82,10 @@ final readonly class Redis
             return;
         }
 
-        // Predis client (object guard satisfies PHPStan when client() typehint is mixed)
-        if (is_object($client) && method_exists($client, 'scan')) {
+        // Predis client (object guard satisfies PHPStan when client() typehint is mixed).
+        // Predis\Client exposes `scan` via __call magic, so method_exists() returns false —
+        // is_callable() honors __call and correctly probes Predis (and any compatible client).
+        if (is_object($client) && is_callable([$client, 'scan'])) {
             $cursor = '0';
 
             do {
@@ -127,8 +129,9 @@ final readonly class Redis
             return;
         }
 
-        // Predis client
-        if (is_object($client) && method_exists($client, 'sscan')) {
+        // Predis client — sscan is exposed via Predis\Client::__call, so use is_callable()
+        // (not method_exists, which returns false for magic methods).
+        if (is_object($client) && is_callable([$client, 'sscan'])) {
             $cursor = '0';
 
             do {
