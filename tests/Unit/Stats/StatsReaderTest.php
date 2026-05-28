@@ -96,7 +96,7 @@ class StatsReaderTest extends TestCase
 
     public function test_read_treats_missing_old_buckets_as_zero_contribution(): void
     {
-        // Simulates `stats_lookback_hours` > `bucket_ttl_seconds/3600`: only
+        // Simulates `activity_lookback_hours` > `activity_bucket_ttl_seconds/3600`: only
         // the recent bucket is populated, older keys do not exist (would have
         // expired). HGETALL on a missing key returns empty → 0 contribution.
         $now = time();

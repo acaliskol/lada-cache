@@ -6,6 +6,8 @@ namespace Spiritix\LadaCache\Tests\Console;
 
 use Illuminate\Console\Scheduling\Schedule;
 use Illuminate\Support\Facades\Config;
+use ReflectionMethod;
+use Spiritix\LadaCache\LadaCacheServiceProvider;
 use Spiritix\LadaCache\Tests\TestCase;
 
 class CalibrateScheduleTest extends TestCase
@@ -16,50 +18,57 @@ class CalibrateScheduleTest extends TestCase
         config(['lada-cache.enable_debugbar' => false]);
     }
 
-    public function testScheduleIsRegisteredWhenEnabledWithCron(): void
+    public function testScheduleIntervalRegistersDailyCalibrationWhenEnabled(): void
     {
         Config::set('lada-cache.calibration.enabled', true);
-        Config::set('lada-cache.calibration.schedule', '0 3 * * 0');
+        Config::set('lada-cache.calibration.schedule_interval', 7);
 
         $events = $this->resolveScheduledCalibrationEvents();
 
         $this->assertCount(1, $events, 'Calibrate command must be scheduled exactly once.');
-        $this->assertSame('0 3 * * 0', $events[0]->expression);
+        $this->assertSame('0 3 * * *', $events[0]->expression);
     }
 
     public function testScheduleIsNotRegisteredWhenCalibrationDisabled(): void
     {
         Config::set('lada-cache.calibration.enabled', false);
-        Config::set('lada-cache.calibration.schedule', '0 3 * * 0');
+        Config::set('lada-cache.calibration.schedule_interval', 7);
 
         $this->assertCount(
             0,
             $this->resolveScheduledCalibrationEvents(),
-            'Disabled calibration must not register the cron.',
+            'Disabled calibration must not register the schedule.',
         );
     }
 
-    public function testScheduleIsNotRegisteredWhenCronStringEmpty(): void
+    public function testScheduleIsNotRegisteredWhenScheduleIntervalIsZero(): void
     {
         Config::set('lada-cache.calibration.enabled', true);
-        Config::set('lada-cache.calibration.schedule', '');
+        Config::set('lada-cache.calibration.schedule_interval', 0);
 
         $this->assertCount(
             0,
             $this->resolveScheduledCalibrationEvents(),
-            'Empty cron string must opt out of auto-schedule.',
+            'Zero schedule interval must opt out of auto-schedule.',
         );
     }
 
-    public function testCustomCronExpressionIsRespected(): void
+    public function testScheduleIntervalGateMatchesEveryNthDay(): void
     {
         Config::set('lada-cache.calibration.enabled', true);
-        Config::set('lada-cache.calibration.schedule', '*/15 * * * *');
+        Config::set('lada-cache.calibration.schedule_interval', 3);
 
         $events = $this->resolveScheduledCalibrationEvents();
 
         $this->assertCount(1, $events);
-        $this->assertSame('*/15 * * * *', $events[0]->expression);
+        $this->assertSame('0 3 * * *', $events[0]->expression);
+
+        $method = new ReflectionMethod(LadaCacheServiceProvider::class, 'calibrationScheduleIntervalMatches');
+        $method->setAccessible(true);
+
+        $this->assertTrue($method->invoke(null, 3, 3 * 86400));
+        $this->assertFalse($method->invoke(null, 3, 4 * 86400));
+        $this->assertTrue($method->invoke(null, 1, 4 * 86400));
     }
 
     /**

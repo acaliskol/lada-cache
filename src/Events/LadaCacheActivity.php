@@ -10,22 +10,11 @@ namespace Spiritix\LadaCache\Events;
  * Lightweight hook so listeners can collect per-table cache counters without
  * forcing every install to pay for the dispatch on the hot path.
  *
- * Activation: requires `lada-cache.events.enabled = true` (defaults to false
- * so unused installs incur zero overhead).
+ * Activation follows `lada-cache.calibration.enabled` so unused installs incur
+ * zero overhead.
  *
- * Example listener:
- *
- *   Event::listen(LadaCacheActivity::class, function (LadaCacheActivity $e): void {
- *       app('redis')->hincrby(
- *           'lada:metrics:'.$e->action,
- *           $e->table ?? 'unknown',
- *           1,
- *       );
- *   });
- *
- * See LadaCacheServiceProvider for listener wiring (StatsCounter is the
- * bundled production-ready listener; CalibrateCommand consumes the resulting
- * per-table HASH buckets via StatsReader).
+ * See LadaCacheServiceProvider for listener wiring. CalibrateCommand consumes
+ * the resulting per-table HASH buckets through the internal reader.
  */
 final class LadaCacheActivity
 {

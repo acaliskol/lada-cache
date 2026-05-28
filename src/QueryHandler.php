@@ -34,19 +34,18 @@ final class QueryHandler
     private array $queuedInvalidations = [];
 
     /**
-     * Cached `lada-cache.events.enabled` flag. Resolved once at construction
-     * (QueryHandler is a singleton, so this happens once per worker) instead
-     * of paying for `config()` lookups on every cache hit / miss / invalidate
-     * — the hot path that touches every cached query.
+     * Cached calibration flag. Resolved once at construction (QueryHandler is
+     * a singleton, so this happens once per worker) instead of paying for
+     * `config()` lookups on every cache hit / miss / invalidate.
      */
-    private readonly bool $eventsEnabled;
+    private readonly bool $calibrationEnabled;
 
     public function __construct(
         private readonly Cache $cache,
         private readonly Invalidator $invalidator,
         private readonly TtlResolver $ttlResolver,
     ) {
-        $this->eventsEnabled = (bool) config('lada-cache.events.enabled', false);
+        $this->calibrationEnabled = (bool) config('lada-cache.calibration.enabled', false);
     }
 
     public function setBuilder(QueryBuilder $builder): self
@@ -253,8 +252,7 @@ final class QueryHandler
     /**
      * Dispatch a {@see LadaCacheActivity} event for the given action.
      *
-     * Opt-in via `lada-cache.events.enabled` to keep hot-path overhead zero
-     * by default. The flag is captured into `$this->eventsEnabled` at
+     * Enabled only while calibration is enabled. The flag is captured at
      * construction so this check is a single bool comparison rather than a
      * `config()` lookup per cache operation.
      *
@@ -265,7 +263,7 @@ final class QueryHandler
      */
     private function dispatchActivity(string $action, string $key, array $tags, Reflector $reflector): void
     {
-        if (! $this->eventsEnabled) {
+        if (! $this->calibrationEnabled) {
             return;
         }
 

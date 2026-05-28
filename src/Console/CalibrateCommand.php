@@ -11,6 +11,7 @@ use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Log;
 use InvalidArgumentException;
 use ReflectionClass;
+use RuntimeException;
 use Spiritix\LadaCache\Calibration\HitRatioAdjustment;
 use Spiritix\LadaCache\Calibration\TtlCalibrationRepository;
 use Spiritix\LadaCache\Database\LadaCacheTrait;
@@ -19,8 +20,8 @@ use Spiritix\LadaCache\Stats\StatsReader;
 use Throwable;
 
 /**
- * Sample Redis OBJECT IDLETIME (and optionally StatsCounter activity) for
- * Lada-cached models and derive per-model TTLs.
+ * Sample Redis OBJECT IDLETIME and recent cache activity for Lada-cached
+ * models and derive per-model TTLs.
  *
  * Algorithm:
  *   1. Discover Eloquent models using LadaCacheTrait (or use --model=FQCN).
@@ -30,8 +31,8 @@ use Throwable;
  *   4. Compute P50, P95, max of the distribution.
  *   5. raw_calibrated = ceil(P95 × safety_factor).
  *   6. Floor against survivor-bias: max(raw, previousTtl / 2).
- *   7. (Opt-in) Read StatsCounter activity for the table over the last
- *      `stats_lookback_hours` hours and adjust the TTL by signal:
+ *   7. Read recent activity for the table over the configured lookback window
+ *      and adjust the TTL by signal:
  *        - 'idletime_only' — StatsReader unavailable or lookback=0; original behavior.
  *        - 'no_activity'   — reads+writes below `min_reads_for_signal`; original behavior.
  *        - 'write_heavy'   — invalidates/(hits+misses) ≥ `write_heavy_ratio`;
@@ -56,7 +57,7 @@ final class CalibrateCommand extends Command
                             {--models-path= : Override scanned directory (default: app_path("Models"))}
                             {--models-namespace= : Override scanned namespace (default: "App\\\\Models\\\\")}';
 
-    protected $description = 'Sample Redis OBJECT IDLETIME (and optional activity counters) for Lada-cached models and compute per-model TTLs.';
+    protected $description = 'Sample Redis OBJECT IDLETIME and recent activity for Lada-cached models and compute per-model TTLs.';
 
     public function __construct(
         private readonly ?Redis $redis = null,
@@ -74,10 +75,8 @@ final class CalibrateCommand extends Command
             return self::SUCCESS;
         }
 
-        // Calibration kapalıyken erken çık — ServiceProvider deps bind etmemiş olabilir
-        // (zero-arg singleton path). Önce flag, sonra deps null kontrolü; yoksa
-        // calibration.enabled=false default değerinde manuel
-        // `php artisan lada-cache:calibrate` çağrısı FAILURE ile düşer.
+        // Check the flag before dependency guards so the zero-argument command
+        // registered while calibration is disabled can exit cleanly.
         if (! (bool) config('lada-cache.calibration.enabled', false)) {
             $this->warn('Lada Cache calibration is disabled. Set LADA_CACHE_CALIBRATION_ENABLED=true to enable.');
 
@@ -115,9 +114,9 @@ final class CalibrateCommand extends Command
         $minSamples = Config::integer('lada-cache.calibration.min_samples', 50);
         $apply = (bool) $this->option('apply');
 
-        $lookbackHours = Config::integer('lada-cache.calibration.stats_lookback_hours', 168);
+        $lookbackHours = Config::integer('lada-cache.calibration.activity_lookback_hours', 168);
         $this->warnIfLookbackExceedsBucketTtl($lookbackHours);
-        // null  = stats signal unavailable (reader not configured OR Redis lookup failed);
+        // null  = activity signal unavailable (reader not configured OR Redis lookup failed);
         // []    = configured + reached Redis, but no activity recorded in window;
         // array = per-table activity counters.
         // We collapse the tri-state into an explicit `$statsState` enum-like
@@ -235,7 +234,7 @@ final class CalibrateCommand extends Command
                 ];
 
                 if (count($pending) >= $batchSize) {
-                    $this->repository->upsertMany($pending);
+                    $this->repository()->upsertMany($pending);
                     $pending = [];
                 }
 
@@ -260,7 +259,7 @@ final class CalibrateCommand extends Command
 
         // Residual rows that didn't fill the final batch.
         if ($pending !== []) {
-            $this->repository->upsertMany($pending);
+            $this->repository()->upsertMany($pending);
         }
 
         $this->table(
@@ -287,7 +286,7 @@ final class CalibrateCommand extends Command
     }
 
     /**
-     * Combine the IDLETIME-derived TTL with StatsCounter activity to pick a
+     * Combine the IDLETIME-derived TTL with recent activity to pick a
      * final value and label the signal source for downstream observability.
      *
      * `$statsState` is the explicit tri-state from {@see handle()}:
@@ -366,12 +365,12 @@ final class CalibrateCommand extends Command
 
     /**
      * Surface a self-contradicting config where the operator asked us to look
-     * back further than StatsCounter retains data. Older buckets have already
+     * back further than the activity bucket retention. Older buckets have already
      * expired, so the pipeline reads return empty for the trailing keys.
      * Non-fatal — keeps the run going under the actual data we have.
      *
      * Fires regardless of whether StatsReader is bound. A misconfigured
-     * `stats_lookback_hours > bucket_ttl_seconds/3600` is still a misconfig
+     * `activity_lookback_hours > activity_bucket_ttl_seconds/3600` is still a misconfig
      * that operators should fix even if they haven't enabled stats yet
      * (silent until you do isn't helpful; alerting on the boundary now means
      * the next env that flips stats on starts clean).
@@ -382,12 +381,12 @@ final class CalibrateCommand extends Command
             return;
         }
 
-        $bucketTtlSeconds = Config::integer('lada-cache.stats.bucket_ttl_seconds', 86400 * 7);
+        $bucketTtlSeconds = Config::integer('lada-cache.calibration.activity_bucket_ttl_seconds', 86400 * 7);
         $bucketTtlHours = (int) floor($bucketTtlSeconds / 3600);
 
         if ($bucketTtlHours > 0 && $lookbackHours > $bucketTtlHours) {
             $this->warn(sprintf(
-                'stats_lookback_hours (%d) exceeds bucket retention (%d h); older buckets have expired and will read empty.',
+                'activity_lookback_hours (%d) exceeds bucket retention (%d h); older buckets have expired and will read empty.',
                 $lookbackHours,
                 $bucketTtlHours,
             ));
@@ -467,7 +466,7 @@ final class CalibrateCommand extends Command
      */
     private function resolveCurrentTtl(string $modelClass): int
     {
-        $calibrated = $this->repository->findForModel($modelClass);
+        $calibrated = $this->repository()->findForModel($modelClass);
 
         if ($calibrated !== null) {
             return $calibrated;
@@ -486,20 +485,13 @@ final class CalibrateCommand extends Command
     private function isIdleTimeSupported(): bool
     {
         try {
-            $client = $this->redis->getConnection()->client();
-            $result = $client->config('GET', 'maxmemory-policy');
+            $policy = $this->readRedisMaxmemoryPolicy();
 
-            // PhpRedis: ['maxmemory-policy' => 'noeviction'] | Predis: ['maxmemory-policy', 'noeviction']
-            if (! is_array($result)) {
-                // Non-array return (e.g. false) → CONFIG GET silently failed.
-                // Assume IDLETIME works but surface a warning so an LFU misconfiguration
-                // doesn't silently calibrate every TTL toward zero.
+            if ($policy === null) {
                 $this->warn('Could not determine Redis maxmemory-policy (CONFIG GET returned non-array). Proceeding under assumption that OBJECT IDLETIME is supported.');
 
                 return true;
             }
-
-            $policy = (string) ($result['maxmemory-policy'] ?? $result[1] ?? '');
 
             if ($policy === '') {
                 $this->warn('Redis maxmemory-policy not reported. Proceeding under assumption that OBJECT IDLETIME is supported.');
@@ -512,6 +504,28 @@ final class CalibrateCommand extends Command
             // CONFIG GET may be ACL-disabled in managed Redis; assume IDLETIME works.
             return true;
         }
+    }
+
+    private function readRedisMaxmemoryPolicy(): ?string
+    {
+        $client = $this->redis()->getConnection()->client();
+
+        if ($client instanceof \Redis) {
+            $result = $client->config('GET', 'maxmemory-policy');
+        } elseif (is_object($client) && is_callable([$client, 'config'])) {
+            $result = $client->{'config'}('GET', 'maxmemory-policy');
+        } else {
+            return null;
+        }
+
+        if (! is_array($result)) {
+            return null;
+        }
+
+        // PhpRedis: ['maxmemory-policy' => 'noeviction'] | Predis: ['maxmemory-policy', 'noeviction']
+        $policy = $result['maxmemory-policy'] ?? $result[1] ?? null;
+
+        return is_scalar($policy) ? (string) $policy : null;
     }
 
     /**
@@ -642,15 +656,16 @@ final class CalibrateCommand extends Command
     private function collectMetrics(string $tableName): array
     {
         $patterns = [
-            $this->redis->prefix('tags:database:*:table_specific:'.$tableName),
-            $this->redis->prefix('tags:database:*:table_unspecific:'.$tableName),
+            $this->redis()->prefix('tags:database:*:table_specific:'.$tableName),
+            $this->redis()->prefix('tags:database:*:table_unspecific:'.$tableName),
         ];
 
-        $connPrefix = (string) (config('database.redis.options.prefix') ?? '');
+        $rawConnectionPrefix = config('database.redis.options.prefix');
+        $connPrefix = is_string($rawConnectionPrefix) ? $rawConnectionPrefix : '';
         $idleTimes = [];
 
         foreach ($patterns as $pattern) {
-            foreach ($this->redis->scanKeys($pattern) as $batch) {
+            foreach ($this->redis()->scanKeys($pattern) as $batch) {
                 foreach ($batch as $tagKey) {
                     $tagKeyStripped = $connPrefix !== '' && str_starts_with($tagKey, $connPrefix)
                         ? substr($tagKey, strlen($connPrefix))
@@ -658,7 +673,7 @@ final class CalibrateCommand extends Command
 
                     // Stream the SET via SSCAN — large tag sets can hold millions of cache keys
                     // and a single SMEMBERS would block Redis and balloon client memory.
-                    foreach ($this->redis->sScanMembers($tagKeyStripped) as $memberBatch) {
+                    foreach ($this->redis()->sScanMembers($tagKeyStripped) as $memberBatch) {
                         foreach ($this->pipelinedIdleTimes($memberBatch) as $idle) {
                             $idleTimes[] = $idle;
                         }
@@ -684,7 +699,7 @@ final class CalibrateCommand extends Command
             return [];
         }
 
-        $client = $this->redis->getConnection()->client();
+        $client = $this->redis()->getConnection()->client();
         $idleTimes = [];
 
         foreach (array_chunk($keys, 100) as $chunk) {
@@ -732,18 +747,22 @@ final class CalibrateCommand extends Command
             $pipelineFlush = 'exec';
             $results = $client->{$pipelineFlush}();
 
-            return is_array($results) ? $results : [];
+            return is_array($results) ? array_values($results) : [];
         }
 
         // Predis: pipeline() takes a closure and returns ordered results.
         if (is_object($client) && method_exists($client, 'pipeline')) {
-            $results = $client->pipeline(static function ($pipe) use ($chunk): void {
+            $results = $client->pipeline(static function (object $pipe) use ($chunk): void {
+                if (! is_callable([$pipe, 'object'])) {
+                    return;
+                }
+
                 foreach ($chunk as $key) {
-                    $pipe->object('IDLETIME', $key);
+                    $pipe->{'object'}('IDLETIME', $key);
                 }
             });
 
-            return is_array($results) ? $results : [];
+            return is_array($results) ? array_values($results) : [];
         }
 
         // No pipeline API → sequential fallback.
@@ -751,11 +770,29 @@ final class CalibrateCommand extends Command
 
         foreach ($chunk as $key) {
             $results[] = is_object($client) && method_exists($client, 'object')
-                ? $client->object('IDLETIME', $key)
+                ? $client->{'object'}('IDLETIME', $key)
                 : null;
         }
 
         return $results;
+    }
+
+    private function redis(): Redis
+    {
+        if ($this->redis === null) {
+            throw new RuntimeException('Lada Cache calibration Redis dependency is not bound.');
+        }
+
+        return $this->redis;
+    }
+
+    private function repository(): TtlCalibrationRepository
+    {
+        if ($this->repository === null) {
+            throw new RuntimeException('Lada Cache calibration repository dependency is not bound.');
+        }
+
+        return $this->repository;
     }
 
     /**

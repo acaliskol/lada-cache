@@ -15,6 +15,7 @@ use Illuminate\Database\MySqlConnection;
 use Illuminate\Database\PostgresConnection;
 use Illuminate\Database\SqliteConnection;
 use Illuminate\Database\SqlServerConnection;
+use Illuminate\Support\Facades\Config;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\ServiceProvider;
 use Laravel\Octane\Events\RequestHandled;
@@ -99,11 +100,9 @@ final class LadaCacheServiceProvider extends ServiceProvider
             $cache->flush();
         });
 
-        // Wire StatsCounter as a listener for LadaCacheActivity events when both
-        // event dispatch AND stats collection are enabled. The counter buffers
-        // in process memory and flushes either on threshold or at app shutdown.
-        if ((bool) config('lada-cache.events.enabled', false)
-            && (bool) config('lada-cache.stats.enabled', false)) {
+        // Calibration records lightweight per-table activity while enabled so
+        // lada-cache:calibrate can adjust TTLs with recent read/write signals.
+        if ((bool) config('lada-cache.calibration.enabled', false)) {
             $events->listen(LadaCacheActivity::class, static function (LadaCacheActivity $event): void {
                 /** @var StatsCounter $counter */
                 $counter = app('lada.stats_counter');
@@ -152,24 +151,25 @@ final class LadaCacheServiceProvider extends ServiceProvider
             }
         }
 
-        // Auto-register the calibration cron when enabled and a schedule expression is set.
+        // Auto-register the calibration command when enabled and schedule_interval > 0.
         // Uses callAfterResolving so we don't force the Schedule kernel to boot unnecessarily —
         // it fires only when the framework itself resolves the scheduler (artisan schedule:* etc).
-        // To opt out, set config('lada-cache.calibration.schedule') to an empty string and call
+        // To opt out, set config('lada-cache.calibration.schedule_interval') to 0 and call
         // Schedule::command(...) yourself in routes/console.php instead.
         $this->callAfterResolving(Schedule::class, function (Schedule $schedule): void {
             if (! (bool) config('lada-cache.calibration.enabled', false)) {
                 return;
             }
 
-            $cron = trim((string) config('lada-cache.calibration.schedule', ''));
+            $scheduleInterval = Config::integer('lada-cache.calibration.schedule_interval', 7);
 
-            if ($cron === '') {
+            if ($scheduleInterval <= 0) {
                 return;
             }
 
             $schedule->command('lada-cache:calibrate', ['--apply'])
-                ->cron($cron)
+                ->dailyAt('03:00')
+                ->when(static fn (): bool => self::calibrationScheduleIntervalMatches($scheduleInterval))
                 ->onOneServer()
                 ->withoutOverlapping()
                 ->runInBackground();
@@ -216,33 +216,33 @@ final class LadaCacheServiceProvider extends ServiceProvider
     {
         $this->app->singleton('lada.redis', static fn () => new Redis);
 
-        $this->app->singleton('lada.cache', static fn (Application $app) => new Cache($app->make('lada.redis'), new Encoder)
+        $this->app->singleton('lada.cache', static fn (Application $app) => new Cache(self::resolveRedis($app), new Encoder)
         );
 
-        $this->app->singleton('lada.invalidator', static fn (Application $app) => new Invalidator($app->make('lada.redis'))
+        $this->app->singleton('lada.invalidator', static fn (Application $app) => new Invalidator(self::resolveRedis($app))
         );
 
         $this->app->singleton('lada.ttl_calibration_repo', static fn () => new TtlCalibrationRepository);
 
         $this->app->singleton('lada.ttl_resolver', static fn (Application $app) => new TtlResolver(
-            $app->make('lada.ttl_calibration_repo'),
+            self::resolveTtlCalibrationRepository($app),
         ));
 
         $this->app->singleton('lada.handler', static fn (Application $app) => new QueryHandler(
-            $app->make('lada.cache'),
-            $app->make('lada.invalidator'),
-            $app->make('lada.ttl_resolver'),
+            self::resolveCache($app),
+            self::resolveInvalidator($app),
+            self::resolveTtlResolver($app),
         ));
 
         $this->app->singleton('lada.stats_counter', static fn (Application $app) => new StatsCounter(
-            $app->make('lada.redis'),
-            (int) config('lada-cache.stats.flush_max_batch', 100),
-            (float) config('lada-cache.stats.flush_max_seconds', 5.0),
-            (int) config('lada-cache.stats.bucket_ttl_seconds', 86400 * 7),
+            self::resolveRedis($app),
+            Config::integer('lada-cache.calibration.activity_flush_max_batch', 100),
+            Config::float('lada-cache.calibration.activity_flush_max_seconds', 5.0),
+            Config::integer('lada-cache.calibration.activity_bucket_ttl_seconds', 86400 * 7),
         ));
 
         $this->app->singleton('lada.stats_reader', static fn (Application $app) => new StatsReader(
-            $app->make('lada.redis'),
+            self::resolveRedis($app),
         ));
     }
 
@@ -360,18 +360,10 @@ final class LadaCacheServiceProvider extends ServiceProvider
                 return new CalibrateCommand;
             }
 
-            // StatsReader is optional — the command falls back to "idletime_only"
-            // when null. Only inject it when both events + stats are enabled, so
-            // disabled installs don't pay for an unused Redis connection.
-            $statsReader = ((bool) config('lada-cache.events.enabled', false)
-                && (bool) config('lada-cache.stats.enabled', false))
-                ? $app->make('lada.stats_reader')
-                : null;
-
             return new CalibrateCommand(
-                $app->make('lada.redis'),
-                $app->make('lada.ttl_calibration_repo'),
-                $statsReader,
+                self::resolveRedis($app),
+                self::resolveTtlCalibrationRepository($app),
+                self::resolveStatsReader($app),
             );
         });
 
@@ -387,5 +379,82 @@ final class LadaCacheServiceProvider extends ServiceProvider
     {
         $this->app->singleton('lada.collector', static fn () => new CacheCollector);
         $this->app->make('debugbar')->addCollector($this->app->make('lada.collector'));
+    }
+
+    private static function calibrationScheduleIntervalMatches(int $scheduleInterval, ?int $timestamp = null): bool
+    {
+        if ($scheduleInterval <= 1) {
+            return true;
+        }
+
+        $dayNumber = intdiv($timestamp ?? time(), 86400);
+
+        return $dayNumber % $scheduleInterval === 0;
+    }
+
+    private static function resolveRedis(Application $app): Redis
+    {
+        $redis = $app->make('lada.redis');
+
+        if (! $redis instanceof Redis) {
+            throw new \RuntimeException('Container binding lada.redis must resolve to '.Redis::class.'.');
+        }
+
+        return $redis;
+    }
+
+    private static function resolveTtlCalibrationRepository(Application $app): TtlCalibrationRepository
+    {
+        $repository = $app->make('lada.ttl_calibration_repo');
+
+        if (! $repository instanceof TtlCalibrationRepository) {
+            throw new \RuntimeException('Container binding lada.ttl_calibration_repo must resolve to '.TtlCalibrationRepository::class.'.');
+        }
+
+        return $repository;
+    }
+
+    private static function resolveCache(Application $app): Cache
+    {
+        $cache = $app->make('lada.cache');
+
+        if (! $cache instanceof Cache) {
+            throw new \RuntimeException('Container binding lada.cache must resolve to '.Cache::class.'.');
+        }
+
+        return $cache;
+    }
+
+    private static function resolveInvalidator(Application $app): Invalidator
+    {
+        $invalidator = $app->make('lada.invalidator');
+
+        if (! $invalidator instanceof Invalidator) {
+            throw new \RuntimeException('Container binding lada.invalidator must resolve to '.Invalidator::class.'.');
+        }
+
+        return $invalidator;
+    }
+
+    private static function resolveTtlResolver(Application $app): TtlResolver
+    {
+        $ttlResolver = $app->make('lada.ttl_resolver');
+
+        if (! $ttlResolver instanceof TtlResolver) {
+            throw new \RuntimeException('Container binding lada.ttl_resolver must resolve to '.TtlResolver::class.'.');
+        }
+
+        return $ttlResolver;
+    }
+
+    private static function resolveStatsReader(Application $app): StatsReader
+    {
+        $statsReader = $app->make('lada.stats_reader');
+
+        if (! $statsReader instanceof StatsReader) {
+            throw new \RuntimeException('Container binding lada.stats_reader must resolve to '.StatsReader::class.'.');
+        }
+
+        return $statsReader;
     }
 }

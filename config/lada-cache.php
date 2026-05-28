@@ -67,38 +67,12 @@ return [
 
     /*
     |--------------------------------------------------------------------------
-    | Per-model TTL overrides
-    |--------------------------------------------------------------------------
-    |
-    | Map of model FQCN to TTL in seconds. Models listed here override the
-    | global expiration_time. Resolution order (first non-null wins):
-    |   1. $model->getLadaTtl() if model implements
-    |      Spiritix\LadaCache\Contracts\HasLadaTtl
-    |   2. lada_cache_calibrations.calibrated_ttl
-    |      (auto-calibration via lada-cache:calibrate, see "Calibration" below)
-    |   3. config('lada-cache.model_ttls.<FQCN>')
-    |   4. config('lada-cache.expiration_time') (global)
-    |
-    | Examples:
-    |   App\Models\City::class       => 86400 * 30, // 30 days for rarely-changing data
-    |   App\Models\Tournament::class => 300,        // 5 minutes for hot state
-    |   App\Models\Order::class      => null,       // fall through to global
-    |
-    | 0 = persist forever (cache until tag-based invalidation).
-    |
-    */
-    'model_ttls' => [
-        // App\Models\City::class => 86400 * 30,
-    ],
-
-    /*
-    |--------------------------------------------------------------------------
     | Auto-calibration
     |--------------------------------------------------------------------------
     |
     | The `lada-cache:calibrate` Artisan command samples Redis OBJECT IDLETIME
-    | for cached keys belonging to each Lada-cached model, computes the
-    | P95 idle time, and derives a per-model TTL via
+    | for cached keys belonging to each Lada-cached model, combines that signal
+    | with recent cache activity, and derives a per-model TTL via
     |
     |     calibrated_ttl = max(ceil(P95 * safety_factor), floor(previous_ttl / 2))
     |
@@ -116,7 +90,7 @@ return [
     |   - `--apply` is required to persist; the default is a dry-run table.
     |   - Models with fewer than `min_samples` data points are skipped.
     |
-    | Designed for periodic cron use, e.g. weekly: `lada-cache:calibrate --apply`.
+    | Designed for periodic use, e.g. weekly: `lada-cache:calibrate --apply`.
     |
     */
     'calibration' => [
@@ -129,31 +103,25 @@ return [
         // With ~500 cached models a batch of 100 reduces DB round-trips ~5x.
         'batch_size' => (int) env('LADA_CACHE_CALIBRATION_BATCH_SIZE', 100),
 
-        // Cron expression for the auto-scheduled calibration run. Empty string disables
-        // the auto-schedule (you can still invoke `php artisan lada-cache:calibrate --apply`
-        // manually or register it yourself in `routes/console.php`).
-        //
-        // Default `0 3 * * 0` = every Sunday at 03:00. Both `enabled=true` AND a non-empty
-        // schedule string are required for the service provider to register the cron.
-        'schedule' => (string) env('LADA_CACHE_CALIBRATION_SCHEDULE', '0 3 * * 0'),
+        // Number of days between auto-scheduled calibration runs.
+        // Default 7 = once a week. Set 0 to disable the auto-schedule (you can
+        // still invoke `php artisan lada-cache:calibrate --apply` manually or
+        // register it yourself in `routes/console.php`).
+        'schedule_interval' => (int) env('LADA_CACHE_CALIBRATION_SCHEDULE_INTERVAL', 7),
 
-        // -------------------------------------------------------------------
-        // Activity-aware calibration (opt-in — requires `events.enabled` AND
-        // `stats.enabled` so StatsCounter has data to read).
-        // -------------------------------------------------------------------
-        //
+        // Recent activity is recorded automatically while calibration is enabled.
         // The calibrate command can enrich the IDLETIME signal with per-table
-        // read / write counts recorded by StatsCounter. With activity data:
+        // read / write counts. With activity data:
         //   - `write_heavy` tables skip the survivor-bias floor so an invalidation
         //     -dominated workload doesn't inflate TTL into wasted memory.
         //   - `read_heavy` tables run through a convergent hit_ratio controller
         //     that pulls TTL toward `target_hit_ratio` by bounded steps.
-        // Without activity (Redis down, stats disabled, cold window) the command
+        // Without activity (Redis down or cold window) the command
         // falls back to the original IDLETIME-only behavior.
 
-        // How far back to aggregate StatsCounter buckets, in hours.
-        // Default 168 = 7 days, matching the bucket retention default below.
-        'stats_lookback_hours' => (int) env('LADA_CACHE_CALIBRATION_STATS_LOOKBACK_HOURS', 168),
+        // How far back to aggregate activity buckets, in hours.
+        // Default 168 = 7 days, matching the retention default below.
+        'activity_lookback_hours' => (int) env('LADA_CACHE_CALIBRATION_ACTIVITY_LOOKBACK_HOURS', 168),
 
         // Minimum reads+writes in the lookback window before the signal is
         // trusted. Below this, the activity adjustment is skipped and the run
@@ -171,62 +139,39 @@ return [
         'hit_ratio_deadband' => (float) env('LADA_CACHE_CALIBRATION_HIT_RATIO_DEADBAND', 0.05),
         'hit_ratio_learning_rate' => (float) env('LADA_CACHE_CALIBRATION_HIT_RATIO_LEARNING_RATE', 0.30),
         'hit_ratio_max_step' => (float) env('LADA_CACHE_CALIBRATION_HIT_RATIO_MAX_STEP', 0.20),
-    ],
-
-    /*
-    |--------------------------------------------------------------------------
-    | Events
-    |--------------------------------------------------------------------------
-    |
-    | Lada Cache dispatches a {@see Spiritix\LadaCache\Events\LadaCacheActivity}
-    | event on every cache hit / miss / invalidate when enabled. This is an
-    | opt-in monitoring hook — disabled by default so unused installs incur
-    | zero overhead on the query hot path.
-    |
-    | Activation requires `events.enabled = true`. Listeners can read the
-    | (action, key, tags, table) payload to build their own counters, or use
-    | the bundled {@see Spiritix\LadaCache\Stats\StatsCounter} listener
-    | configured below.
-    |
-    */
-    'events' => [
-        'enabled' => (bool) env('LADA_CACHE_EVENTS_ENABLED', false),
-    ],
-
-    /*
-    |--------------------------------------------------------------------------
-    | Stats Counter
-    |--------------------------------------------------------------------------
-    |
-    | When `stats.enabled = true` (and `events.enabled = true`), the bundled
-    | StatsCounter listener aggregates LadaCacheActivity events in process
-    | memory and periodically writes per-table HASH counters to Redis:
-    |
-    |   lada:stats:YYYYMMDDHH
-    |     field "users:hit"        → 42819
-    |     field "users:miss"       → 512
-    |     field "users:invalidate" → 120
-    |     ...
-    |
-    | Flush triggers (whichever fires first):
-    |   - Distinct (table:action) keys exceed `flush_max_batch`
-    |   - Time since last flush exceeds `flush_max_seconds`
-    |   - The application terminates
-    |
-    | The `lada-cache:calibrate` command reads these buckets via StatsReader
-    | to drive activity-aware TTL adjustment (see "Activity-aware calibration"
-    | above).
-    |
-    */
-    'stats' => [
-        'enabled' => (bool) env('LADA_CACHE_STATS_ENABLED', false),
 
         // In-memory aggregation limits before forcing a flush.
-        'flush_max_batch' => (int) env('LADA_CACHE_STATS_FLUSH_MAX_BATCH', 100),
-        'flush_max_seconds' => (float) env('LADA_CACHE_STATS_FLUSH_MAX_SECONDS', 5.0),
+        'activity_flush_max_batch' => (int) env('LADA_CACHE_CALIBRATION_ACTIVITY_FLUSH_MAX_BATCH', 100),
+        'activity_flush_max_seconds' => (float) env('LADA_CACHE_CALIBRATION_ACTIVITY_FLUSH_MAX_SECONDS', 5.0),
 
         // Per-bucket retention in seconds. Default = 7 days.
-        'bucket_ttl_seconds' => (int) env('LADA_CACHE_STATS_BUCKET_TTL_SECONDS', 86400 * 7),
+        'activity_bucket_ttl_seconds' => (int) env('LADA_CACHE_CALIBRATION_ACTIVITY_BUCKET_TTL_SECONDS', 86400 * 7),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Per-model TTL overrides
+    |--------------------------------------------------------------------------
+    |
+    | Map of model FQCN to TTL in seconds. Models listed here override the
+    | global expiration_time. Resolution order (first non-null wins):
+    |   1. $model->getLadaTtl() if model implements
+    |      Spiritix\LadaCache\Contracts\HasLadaTtl
+    |   2. lada_cache_calibrations.calibrated_ttl
+    |      (auto-calibration via lada-cache:calibrate, see "Auto-calibration" above)
+    |   3. config('lada-cache.model_ttls.<FQCN>')
+    |   4. config('lada-cache.expiration_time') (global)
+    |
+    | Examples:
+    |   App\Models\City::class       => 86400 * 30, // 30 days for rarely-changing data
+    |   App\Models\Tournament::class => 300,        // 5 minutes for hot state
+    |   App\Models\Order::class      => null,       // fall through to global
+    |
+    | 0 = persist forever (cache until tag-based invalidation).
+    |
+    */
+    'model_ttls' => [
+        // App\Models\City::class => 86400 * 30,
     ],
 
     /*

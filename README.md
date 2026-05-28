@@ -177,8 +177,8 @@ php artisan lada-cache:calibrate --apply      # persist results
 
 Picking the right TTL per model is a guessing game without production data.
 `lada-cache:calibrate` removes the guesswork: it samples Redis `OBJECT IDLETIME`
-for cached keys belonging to each Lada-cached model, computes the P95 idle
-time, and derives a per-model TTL via:
+for cached keys belonging to each Lada-cached model, combines that with recent
+cache activity, and derives a per-model TTL via:
 
 ```
 calibrated_ttl = max(ceil(P95 * safety_factor), floor(previous_ttl / 2))
@@ -199,7 +199,7 @@ LADA_CACHE_CALIBRATION_ENABLED=true        # default: false
 LADA_CACHE_CALIBRATION_SAFETY_FACTOR=2.0   # P95 multiplier
 LADA_CACHE_CALIBRATION_MIN_SAMPLES=50      # skip models with fewer samples
 LADA_CACHE_CALIBRATION_CACHE_TTL=300       # in-memory map cache, seconds
-LADA_CACHE_CALIBRATION_SCHEDULE="0 3 * * 0"  # cron — empty string = no auto-schedule
+LADA_CACHE_CALIBRATION_SCHEDULE_INTERVAL=7 # run once every 7 days; 0 = no auto-schedule
 ```
 
 Then publish & run the package migration:
@@ -209,16 +209,16 @@ php artisan vendor:publish --tag=migrations
 php artisan migrate
 ```
 
-### Auto-scheduled cron
+### Auto-scheduled run
 
 The package auto-registers the calibration cron via
-`callAfterResolving(Schedule::class)` when both `enabled=true` and `schedule`
-(a cron expression) are set. The default schedule is **every Sunday at 03:00**
-(`0 3 * * 0`) — long enough for TTLs to converge on real access patterns
-without bombing Redis with daily scans.
+`callAfterResolving(Schedule::class)` when calibration is enabled and
+`schedule_interval` is greater than zero. The default is **once every 7 days**
+at 03:00 — long enough for TTLs to converge on real access patterns without
+bombing Redis with daily scans.
 
-To customise, override `LADA_CACHE_CALIBRATION_SCHEDULE` with any cron
-expression, or set it to an empty string and register the command yourself:
+To customise, set `LADA_CACHE_CALIBRATION_SCHEDULE_INTERVAL` to the number of
+days between runs, or set it to `0` and register the command yourself:
 
 ```php
 // routes/console.php (Laravel 11+) or app/Console/Kernel.php
@@ -238,53 +238,15 @@ and `->runInBackground()` — safe under multi-server Horizon deployments.
 - Pipelined `OBJECT IDLETIME` calls and cursor-driven `SSCAN`/`SCAN` keep
   the command non-blocking even against millions of cached keys.
 
-## Stats / Activity Counter
-
-Lada Cache can publish a `LadaCacheActivity` event on every cache hit, miss,
-and invalidate. The event is **opt-in** — disabled by default so unused
-installs incur zero overhead on the query hot path.
-
-```env
-LADA_CACHE_EVENTS_ENABLED=true
-```
-
-The event carries the action (`hit`/`miss`/`invalidate`), the cache key, the
-tags, and the primary table — letting you wire any listener you like (Prometheus
-exporter, structured log line, custom counter…).
-
-### Bundled StatsCounter listener
-
-For the common "count per-table activity over time" case, the package ships a
-buffered listener that writes hourly HASH buckets to Redis:
-
-```env
-LADA_CACHE_EVENTS_ENABLED=true
-LADA_CACHE_STATS_ENABLED=true
-```
-
-```
-lada:stats:YYYYMMDDHH
-  field "users:hit"        → 42819
-  field "users:miss"       → 512
-  field "users:invalidate" → 120
-  ...
-```
-
-Buckets self-evict via TTL (default 7 days). The counter aggregates in process
-memory and flushes when distinct (table:action) keys exceed
-`flush_max_batch`, when `flush_max_seconds` elapses since the last flush, or
-when the application terminates — works under FPM, Octane, queue workers, and
-the scheduler.
-
 ### Activity-aware calibration
 
-When the StatsCounter is enabled, `lada-cache:calibrate` enriches its IDLETIME
-signal with read / write counts from the last `stats_lookback_hours` and labels
-each model with a signal source:
+While calibration is enabled, Lada records lightweight per-table activity and
+uses it on the next `lada-cache:calibrate` run. Each model is labeled with a
+signal source:
 
 | Signal | When | Effect |
 |--------|------|--------|
-| `idletime_only` | StatsReader unavailable or Redis lookup failed | Original IDLETIME-only TTL |
+| `idletime_only` | Activity read unavailable or Redis lookup failed | Original IDLETIME-only TTL |
 | `no_activity` | reads + writes below `min_reads_for_signal` | Original IDLETIME-only TTL |
 | `write_heavy` | invalidates / (hits+misses) ≥ `write_heavy_ratio` | Skip survivor-bias floor (writes were going to invalidate anyway) |
 | `read_heavy` | otherwise | Hit-ratio proportional control toward `target_hit_ratio` |
@@ -292,13 +254,14 @@ each model with a signal source:
 Tuning knobs (all `LADA_CACHE_CALIBRATION_*` env vars):
 
 ```env
-LADA_CACHE_CALIBRATION_STATS_LOOKBACK_HOURS=168      # 7 days
+LADA_CACHE_CALIBRATION_ACTIVITY_LOOKBACK_HOURS=168      # 7 days
 LADA_CACHE_CALIBRATION_MIN_READS_FOR_SIGNAL=10
 LADA_CACHE_CALIBRATION_WRITE_HEAVY_RATIO=0.5
 LADA_CACHE_CALIBRATION_TARGET_HIT_RATIO=0.80
 LADA_CACHE_CALIBRATION_HIT_RATIO_DEADBAND=0.05
 LADA_CACHE_CALIBRATION_HIT_RATIO_LEARNING_RATE=0.30
 LADA_CACHE_CALIBRATION_HIT_RATIO_MAX_STEP=0.20
+LADA_CACHE_CALIBRATION_ACTIVITY_BUCKET_TTL_SECONDS=604800
 ```
 
 The calibration log line includes per-signal counters so you can graph the

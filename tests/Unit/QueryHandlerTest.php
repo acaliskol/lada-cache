@@ -5,8 +5,10 @@ declare(strict_types=1);
 namespace Spiritix\LadaCache\Tests\Unit;
 
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Event;
 use Spiritix\LadaCache\Cache;
 use Spiritix\LadaCache\Encoder;
+use Spiritix\LadaCache\Events\LadaCacheActivity;
 use Spiritix\LadaCache\Hasher;
 use Spiritix\LadaCache\Invalidator;
 use Spiritix\LadaCache\QueryHandler;
@@ -89,5 +91,34 @@ class QueryHandlerTest extends TestCase
         foreach ($tags as $tag) {
             $this->assertSame(1, (int) $this->redis->sismember($this->redis->prefix($tag), $this->redis->prefix($key)));
         }
+    }
+
+    public function testCacheActivityFollowsCalibrationEnabledFlag(): void
+    {
+        config(['lada-cache.calibration.enabled' => true]);
+        Event::fake([LadaCacheActivity::class]);
+
+        $handler = new QueryHandler($this->cache, $this->invalidator, $this->ttlResolver);
+        $handler->setBuilder(DB::table('cars'));
+
+        $handler->cacheQuery(static fn (): array => [['id' => 1, 'name' => 'car']]);
+
+        Event::assertDispatched(
+            LadaCacheActivity::class,
+            static fn (LadaCacheActivity $event): bool => $event->action === 'miss' && $event->table === 'cars',
+        );
+    }
+
+    public function testCacheActivityIsSilentWhenCalibrationDisabled(): void
+    {
+        config(['lada-cache.calibration.enabled' => false]);
+        Event::fake([LadaCacheActivity::class]);
+
+        $handler = new QueryHandler($this->cache, $this->invalidator, $this->ttlResolver);
+        $handler->setBuilder(DB::table('cars'));
+
+        $handler->cacheQuery(static fn (): array => [['id' => 1, 'name' => 'car']]);
+
+        Event::assertNotDispatched(LadaCacheActivity::class);
     }
 }
