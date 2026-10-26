@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace Spiritix\LadaCache\Tests\Unit;
 
+use Illuminate\Redis\Connections\PredisConnection;
+use Illuminate\Support\Facades\Redis as RedisFacade;
 use Spiritix\LadaCache\Cache;
 use Spiritix\LadaCache\Encoder;
 use Spiritix\LadaCache\Redis;
@@ -83,6 +85,40 @@ class CacheTest extends TestCase
         $cache->set($key, $tags, $value);
         $this->assertSame($encoded, $this->redis->get($prefixedKey));
         $this->assertSame(1, (int) $this->redis->sismember($prefixedTag, $prefixedKey));
+    }
+
+    public function testSetAndRepairWriteAllTagMembershipsInOneRoundTrip(): void
+    {
+        $connection = new class (RedisFacade::connection('cache')->client()) extends PredisConnection {
+            /** @var list<string> */
+            public array $commands = [];
+
+            public function command($method, array $parameters = [])
+            {
+                $this->commands[] = $method;
+
+                return parent::command($method, $parameters);
+            }
+        };
+
+        $tags = ['t1', 't2', 't3'];
+        $cache = new Cache(new Redis($connection), $this->encoder, 60);
+
+        $cache->set('k3', $tags, 'value');
+
+        $this->assertSame(['set', 'pipeline'], $connection->commands);
+
+        foreach ($tags as $tag) {
+            $this->assertSame(1, (int) $this->redis->sismember('p:'.$tag, 'p:k3'));
+        }
+
+        $this->redis->srem('p:t2', 'p:k3');
+        $connection->commands = [];
+
+        $cache->repairTagMembership('k3', $tags);
+
+        $this->assertSame(['pipeline'], $connection->commands);
+        $this->assertSame(1, (int) $this->redis->sismember('p:t2', 'p:k3'));
     }
 
     public function testGetReturnsNullWhenKeyMissing(): void
